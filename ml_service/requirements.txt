@@ -1,0 +1,20 @@
+# Install PyTorch first for your platform, e.g.:
+#   GPU CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CPU:           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# Then:
+#   pip install -r requirements.txt
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+Pillow>=10.3.0
+numpy>=1.26.0
+transformers>=4.40.0
+accelerate>=0.29.0
+huggingface_hub>=0.22.0
+prometheus-fastapi-instrumentator>=6.1.0
+safetensors>=0.4.0
+timm>=0.9.16
+einops>=0.7.0
+kornia>=0.7.3

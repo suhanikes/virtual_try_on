@@ -1,0 +1,145 @@
+.viewer-wrap {
+  padding: 14px;
+  display: grid;
+  place-items: center;
+  background: #ffffff;
+  border-radius: 20px;
+}
+
+.frame {
+  width: min(92vw, 400px);
+  aspect-ratio: 3 / 4;
+  max-width: 380px;
+  border-radius: 14px;
+  overflow: hidden;
+  position: relative;
+  border: 1px solid rgba(158, 106, 255, 0.22);
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
+}
+
+#person-img,
+#garment-canvas,
+#pick-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#person-img {
+  transform-origin: 0 0;
+  display: none;
+  cursor: grab;
+  z-index: 1;
+  max-width: none;
+}
+
+#garment-canvas {
+  z-index: 2;
+  pointer-events: none;
+}
+
+#pick-canvas {
+  z-index: 4;
+  pointer-events: none;
+}
+
+.tryon-user-adjust-layer {
+  cursor: grab;
+  touch-action: none;
+}
+
+.tryon-user-adjust-layer:active {
+  cursor: grabbing;
+}
+
+.hint {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 10px;
+  z-index: 5;
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(158, 106, 255, 0.2);
+  backdrop-filter: blur(4px);
+  color: #4b4662;
+}
+
+.drop-note {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 0;
+  color: #8a8498;
+  font-size: 13px;
+  text-align: center;
+  padding: 18px;
+  transition: opacity 160ms ease;
+}
+
+.controls {
+  width: min(92vw, 400px);
+  max-width: 380px;
+  margin: 10px auto 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  padding-bottom: 6px;
+}
+
+.controls input[type='file'] {
+  width: 100%;
+  font-size: 12px;
+  color: #465560;
+}
+
+.controls button {
+  border: 1px solid rgba(64, 58, 92, 0.26);
+  background: rgba(245, 245, 249, 0.95);
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-family: 'Cabin', sans-serif;
+  font-size: 11px;
+  color: #46425e;
+  cursor: pointer;
+}
+
+.controls label {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  font-family: 'Cabin', sans-serif;
+  font-size: 11px;
+  color: #384957;
+}
+
+.controls input[type='range'] {
+  width: 100%;
+}
+
+.tryon-like-btn {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  z-index: 8;
+  display: flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.76);
+  background: rgba(255, 255, 255, 0.36);
+  box-shadow: 0 8px 16px -8px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+}
