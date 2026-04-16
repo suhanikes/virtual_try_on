@@ -7,8 +7,11 @@
     "build": "vite build",
     "dev": "vite",
     "dev:ml": "uvicorn main:app --host 0.0.0.0 --port 5000 --app-dir ml_service",
+    "dev:ml-removebg": "ml_service\\venv_removebg\\Scripts\\python -m uvicorn main:app --host 0.0.0.0 --port 5000 --app-dir ml_service",
     "dev:backend": "npm --prefix backend run dev",
-    "start:backend": "npm --prefix backend run start"
+    "start:backend": "npm --prefix backend run start",
+    "dev:dress-recolor-backend": "npm --prefix dress-recolor-backend run dev",
+    "start:dress-recolor-backend": "npm --prefix dress-recolor-backend run start"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -44,6 +47,9 @@
     "@radix-ui/react-tooltip": "1.1.8",
     "@react-three/drei": "9.92.7",
     "@react-three/fiber": "8.15.19",
+    "axios": "1.7.9",
+    "konva": "9.3.18",
+    "react-konva": "18.2.10",
     "canvas-confetti": "1.9.4",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",

@@ -4,6 +4,7 @@ backend/node_modules/
 
 # Python
 ml_service/.venv/
+ml_service/venv_removebg/
 __pycache__/
 *.py[cod]
 .Python

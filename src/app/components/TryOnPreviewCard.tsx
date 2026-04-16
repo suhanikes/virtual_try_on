@@ -4,6 +4,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { garmentStyles } from '../config/garmentStyles';
 import type { FabricOption } from '../types/fabric';
+import { DressRecolorWorkflow } from '../dressRecolor/DressRecolorWorkflow';
+import { ensureMeshUv2ForAoMap } from '../utils/ensureMeshUv2';
 
 type Point = {
   x: number;
@@ -21,6 +23,11 @@ type UploadedImage = {
   src: string;
   naturalWidth: number;
   naturalHeight: number;
+};
+
+type DressRecolorSource = {
+  file: File;
+  url: string;
 };
 
 /** Upload modal: optional crop first, then shoulder marks (workflow order). */
@@ -49,10 +56,14 @@ interface TryOnPreviewCardProps {
   selectedFabric?: FabricOption;
   isColorLiked?: boolean;
   onToggleColorLike?: () => void;
+  dressRecoloringMode: boolean;
+  onDressRecoloringModeChange: (next: boolean) => void;
 }
 
 const FRAME_W = 300;
 const FRAME_H = 400;
+/** Internal GLB render resolution; higher = cleaner downscale onto FRAME_W×FRAME_H (reduces moiré on detailed models). */
+const GARMENT_RENDER_PX = 1200;
 const FABRIC_MESH_HINTS = [
   'fabric',
   'cloth',
@@ -101,15 +112,6 @@ function isFabricMesh(mesh: THREE.Mesh): boolean {
   }
 
   return hasUv;
-}
-
-function ensureUv2(mesh: THREE.Mesh) {
-  const geometry = mesh.geometry;
-  if (!geometry || !('attributes' in geometry) || geometry.attributes.uv2 || !geometry.attributes.uv) {
-    return;
-  }
-
-  geometry.setAttribute('uv2', geometry.attributes.uv.clone());
 }
 
 function configureTexture(texture: THREE.Texture, repeat: [number, number], isColorTexture = false) {
@@ -436,6 +438,8 @@ export function TryOnPreviewCard({
   selectedFabric,
   isColorLiked = false,
   onToggleColorLike,
+  dressRecoloringMode,
+  onDressRecoloringModeChange,
 }: TryOnPreviewCardProps) {
   const selectedStyle = useMemo(
     () => garmentStyles.find((style) => style.id === selectedGarmentId) ?? garmentStyles[0],
@@ -472,7 +476,6 @@ export function TryOnPreviewCard({
   const garmentColorRef = useRef(garmentColor ?? '#a09998');
   const selectedFabricRef = useRef<FabricOption | undefined>(selectedFabric);
 
-  const [hintText, setHintText] = useState('Click LEFT then RIGHT garment shoulder in this card.');
   const [isMarkingGarment, setIsMarkingGarment] = useState(true);
   const [hasGarmentShoulders, setHasGarmentShoulders] = useState(false);
   const [hasUserImage, setHasUserImage] = useState(false);
@@ -486,6 +489,20 @@ export function TryOnPreviewCard({
   const [layoutTick, setLayoutTick] = useState(0);
   const [shoulderOverlayPoints, setShoulderOverlayPoints] = useState<Point[]>([]);
   const [userPhotoStep, setUserPhotoStep] = useState<UserPhotoWorkflowStep>('crop-or-skip');
+  const [dressRecolorSource, setDressRecolorSource] = useState<DressRecolorSource | null>(null);
+
+  useEffect(() => {
+    if (!dressRecoloringMode) {
+      setDressRecolorSource((prev) => {
+        if (prev?.url) {
+          URL.revokeObjectURL(prev.url);
+        }
+        return null;
+      });
+      return;
+    }
+    setShowUserMarkerModal(false);
+  }, [dressRecoloringMode]);
 
   useLayoutEffect(() => {
     const img = markerImageRef.current;
@@ -682,19 +699,23 @@ export function TryOnPreviewCard({
     const opacity = state.fitOpacity / 100;
 
     const off = document.createElement('canvas');
-    off.width = 900;
-    off.height = 900;
+    off.width = GARMENT_RENDER_PX;
+    off.height = GARMENT_RENDER_PX;
 
     const renderer = new THREE.WebGLRenderer({
       canvas: off,
       antialias: true,
+      // Keep transparent background so garment can overlay user photo like Dressika.
       alpha: true,
+      premultipliedAlpha: true,
       preserveDrawingBuffer: true,
     });
 
     renderer.setPixelRatio(1);
-    renderer.setSize(900, 900);
-    renderer.setClearColor(0xffffff, 0);
+    renderer.setSize(GARMENT_RENDER_PX, GARMENT_RENDER_PX);
+    renderer.setClearColor(0x000000, 0);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.NoToneMapping;
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 100);
@@ -747,7 +768,7 @@ export function TryOnPreviewCard({
               }
 
               allMeshes.push(mesh);
-              ensureUv2(mesh);
+              ensureMeshUv2ForAoMap(mesh);
               if (isFabricMesh(mesh)) {
                 namedFabricMeshes.push(mesh);
               }
@@ -758,13 +779,21 @@ export function TryOnPreviewCard({
             const textureSet = activeFabric ? await getOrLoadFabricTextureSet(activeFabric) : null;
             const lowPoly = countTriangles(fabricMeshes) < 10000;
 
+            fabricMeshes.forEach((m) => ensureMeshUv2ForAoMap(m));
+            const missingUv2 = fabricMeshes.some((m) => !m.geometry?.attributes?.uv2);
+            const aoTex = missingUv2 ? null : textureSet?.aoMap ?? null;
+
             fallbackMaterial = new THREE.MeshStandardMaterial({
               color: tintColor,
               roughness: 0.42,
               metalness: 0.04,
-              side: THREE.DoubleSide,
+              // DoubleSide + thin/quilted geometry causes z-fighting (static sparkle/noise); card shows front only.
+              side: THREE.FrontSide,
               transparent: opacity < 1,
               opacity,
+              polygonOffset: true,
+              polygonOffsetFactor: 1,
+              polygonOffsetUnits: 1,
             });
 
             if (activeFabric && textureSet) {
@@ -776,13 +805,16 @@ export function TryOnPreviewCard({
                 roughness: 1.0,
                 displacementMap: lowPoly ? null : textureSet.displacementMap,
                 displacementScale: lowPoly ? 0 : 0.02,
-                aoMap: textureSet.aoMap,
-                aoMapIntensity: textureSet.aoMap ? 1.0 : 0,
+                aoMap: aoTex,
+                aoMapIntensity: aoTex ? 1.0 : 0,
                 metalness: 0.05,
                 color: tintColor,
-                side: THREE.DoubleSide,
+                side: THREE.FrontSide,
                 transparent: opacity < 1,
                 opacity,
+                polygonOffset: true,
+                polygonOffsetFactor: 1,
+                polygonOffsetUnits: 1,
               });
             }
 
@@ -828,6 +860,8 @@ export function TryOnPreviewCard({
             const drawX = (FRAME_W - drawW) / 2;
             const drawY = (FRAME_H - drawH) + shiftMul * FRAME_H;
 
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(off, drawX, drawY, drawW, drawH);
           } catch (error) {
             console.error(error);
@@ -869,7 +903,6 @@ export function TryOnPreviewCard({
 
       stateRef.current.glbBuffer = loaded;
       renderGarment();
-      setHintText('GLB loaded. Click LEFT then RIGHT garment shoulder in this card.');
     };
 
     reader.readAsArrayBuffer(file);
@@ -895,7 +928,6 @@ export function TryOnPreviewCard({
         setCropRectNatural(null);
         setUserPhotoStep('crop-or-skip');
         setShowUserMarkerModal(true);
-        setHintText('Step 1: Crop your photo (optional), or use the full image. Then mark shoulders.');
       };
       img.src = loaded;
     };
@@ -936,10 +968,17 @@ export function TryOnPreviewCard({
 
     drawPickOverlay([], false);
 
+    if (dressRecoloringMode) {
+      state.glbBuffer = null;
+      setIsMarkingGarment(false);
+      setHasGarmentShoulders(false);
+      renderGarment();
+      return;
+    }
+
     const modelUrl = selectedStyle?.modelUrl;
     if (!modelUrl) {
       state.glbBuffer = null;
-      setHintText('Model missing. Choose another neckline style or upload GLB by dropping it on card.');
       renderGarment();
       return;
     }
@@ -960,13 +999,11 @@ export function TryOnPreviewCard({
 
         stateRef.current.glbBuffer = buffer;
         renderGarment();
-        setHintText('Click LEFT then RIGHT garment shoulder in this card.');
       } catch (error) {
         console.error(error);
         if (!canceled) {
           stateRef.current.glbBuffer = null;
           renderGarment();
-          setHintText('Could not auto-load garment GLB. Drop a GLB file into the card.');
         }
       }
     };
@@ -976,7 +1013,7 @@ export function TryOnPreviewCard({
     return () => {
       canceled = true;
     };
-  }, [drawPickOverlay, renderGarment, selectedStyle?.modelUrl]);
+  }, [drawPickOverlay, renderGarment, dressRecoloringMode, selectedStyle?.modelUrl]);
 
   useEffect(() => {
     garmentColorRef.current = garmentColor ?? '#a09998';
@@ -994,7 +1031,6 @@ export function TryOnPreviewCard({
 
     const state = stateRef.current;
     if (!state.glbBuffer) {
-      setHintText('Upload or load a garment GLB first.');
       return;
     }
 
@@ -1011,7 +1047,6 @@ export function TryOnPreviewCard({
       setIsMarkingGarment(false);
       setHasGarmentShoulders(true);
       drawPickOverlay([], false);
-      setHintText('Garment shoulders captured. Upload your photo: crop or use full image, then mark your shoulders.');
     }
   };
 
@@ -1025,7 +1060,20 @@ export function TryOnPreviewCard({
 
     const file = files[0];
     if (file.type.startsWith('image/')) {
+      if (dressRecoloringMode) {
+        setDressRecolorSource((prev) => {
+          if (prev?.url) {
+            URL.revokeObjectURL(prev.url);
+          }
+          return { file, url: URL.createObjectURL(file) };
+        });
+        return;
+      }
       loadPhoto(file);
+      return;
+    }
+
+    if (dressRecoloringMode) {
       return;
     }
 
@@ -1040,13 +1088,23 @@ export function TryOnPreviewCard({
       return;
     }
 
+    if (dressRecoloringMode) {
+      setDressRecolorSource((prev) => {
+        if (prev?.url) {
+          URL.revokeObjectURL(prev.url);
+        }
+        return { file, url: URL.createObjectURL(file) };
+      });
+      event.target.value = '';
+      return;
+    }
+
     loadPhoto(file);
     event.target.value = '';
   };
 
   const handleMarkGarment = () => {
     if (!stateRef.current.glbBuffer) {
-      setHintText('Model missing. Drop a GLB file on the card, then mark garment shoulders.');
       return;
     }
 
@@ -1057,7 +1115,6 @@ export function TryOnPreviewCard({
     st.modelShoulders = [];
     setIsMarkingGarment(true);
     setHasGarmentShoulders(false);
-    setHintText('Click LEFT then RIGHT garment shoulder in this card.');
     drawPickOverlay([], true);
 
     const personImg = personImgRef.current;
@@ -1109,8 +1166,10 @@ export function TryOnPreviewCard({
 
       const img = markerImageRef.current;
       const cur = clientToNaturalPoint(e.clientX, e.clientY, img);
-      const nw = Math.max(uploadedImage?.naturalWidth ?? img.naturalWidth, 1);
-      const nh = Math.max(uploadedImage?.naturalHeight ?? img.naturalHeight, 1);
+      // Must match the displayed <img> intrinsic size (same as clientToNaturalPoint), not React state —
+      // stale uploadedImage.natural* breaks overlay vs canvas crop alignment.
+      const nw = Math.max(img.naturalWidth, 1);
+      const nh = Math.max(img.naturalHeight, 1);
       setCropRectNatural(naturalCropRectFromCorners(cropDragStartNaturalRef.current, cur, nw, nh));
     };
 
@@ -1127,7 +1186,7 @@ export function TryOnPreviewCard({
       window.removeEventListener('pointerup', endDrag);
       window.removeEventListener('pointercancel', endDrag);
     };
-  }, [isCropMode, uploadedImage?.naturalWidth, uploadedImage?.naturalHeight]);
+  }, [isCropMode]);
 
   useEffect(() => {
     if (!showUserMarkerModal) {
@@ -1160,8 +1219,8 @@ export function TryOnPreviewCard({
       // Continue; drawImage may still work.
     }
 
-    const nw = Math.max(uploadedImage.naturalWidth, 1);
-    const nh = Math.max(uploadedImage.naturalHeight, 1);
+    const nw = Math.max(previewImage.naturalWidth, 1);
+    const nh = Math.max(previewImage.naturalHeight, 1);
     const r = cropRectNatural;
 
     const x0 = clamp(Math.round(r.x), 0, nw);
@@ -1174,7 +1233,6 @@ export function TryOnPreviewCard({
     const cropHeight = Math.max(1, Math.abs(y1 - y0));
 
     if (cropWidth < 8 || cropHeight < 8) {
-      setHintText('Crop area is too small. Drag a larger area and try again.');
       return;
     }
 
@@ -1184,7 +1242,6 @@ export function TryOnPreviewCard({
 
     const context = canvas.getContext('2d');
     if (!context) {
-      setHintText('Crop failed. Please try again.');
       return;
     }
 
@@ -1201,7 +1258,6 @@ export function TryOnPreviewCard({
     setIsCropMode(false);
     setCropRectNatural(null);
     setUserPhotoStep('mark-shoulders');
-    setHintText('Step 2: Tap LEFT shoulder, then RIGHT on the photo. Then Apply Garment on the card.');
   };
 
   const skipCropUseFullImage = () => {
@@ -1213,7 +1269,6 @@ export function TryOnPreviewCard({
     setCropRectNatural(null);
     setUserNaturalPoints([]);
     setUserPhotoStep('mark-shoulders');
-    setHintText('Step 2: Tap LEFT shoulder, then RIGHT on your photo. Then Apply Garment.');
   };
 
   const handleCropButtonClick = () => {
@@ -1225,18 +1280,12 @@ export function TryOnPreviewCard({
       setIsCropMode(true);
       setCropRectNatural(null);
       setUserNaturalPoints([]);
-      setHintText('Drag on the photo to select the crop box, then tap Apply Crop again.');
       return;
     }
 
     if (!cropRectNatural || cropRectNatural.width < 8 || cropRectNatural.height < 8) {
       setIsCropMode(false);
       setCropRectNatural(null);
-      setHintText(
-        userPhotoStep === 'mark-shoulders'
-          ? 'Crop canceled. Mark LEFT then RIGHT shoulder.'
-          : 'Crop canceled. Use full image or try cropping again.',
-      );
       return;
     }
 
@@ -1249,7 +1298,6 @@ export function TryOnPreviewCard({
     }
 
     setIsRemovingBackground(true);
-    setHintText('Removing background...');
     let timeoutId: number | null = null;
 
     try {
@@ -1305,7 +1353,6 @@ export function TryOnPreviewCard({
       setIsCropMode(false);
       setCropRectNatural(null);
       setUserPhotoStep('crop-or-skip');
-      setHintText('Background removed. Crop if needed, or use full image, then mark shoulders.');
     } catch (error) {
       const isAbortError = error instanceof DOMException && error.name === 'AbortError';
       const detail = isAbortError
@@ -1314,7 +1361,7 @@ export function TryOnPreviewCard({
           ? error.message
           : 'Background removal failed.';
 
-      setHintText(`Background removal failed: ${detail}`);
+      console.error('Background removal failed:', detail);
     } finally {
       if (timeoutId !== null) {
         window.clearTimeout(timeoutId);
@@ -1326,12 +1373,10 @@ export function TryOnPreviewCard({
   const applyGarmentAlignment = () => {
     const state = stateRef.current;
     if (!uploadedImage || state.modelShoulders.length !== 2 || userNaturalPoints.length !== 2) {
-      setHintText('Mark garment shoulders on the card, then your shoulders in the popup, then apply.');
       return;
     }
 
     if (userPhotoStep !== 'mark-shoulders') {
-      setHintText('Finish photo setup: use full image or apply a crop, then mark your shoulders.');
       return;
     }
 
@@ -1346,7 +1391,6 @@ export function TryOnPreviewCard({
       );
 
       if (!solved) {
-        setHintText('Points are too close. Please re-mark shoulders.');
         return;
       }
 
@@ -1377,17 +1421,8 @@ export function TryOnPreviewCard({
       personImg.style.clipPath = 'none';
       applyImageTransform();
 
-      const m1 = state.modelShoulders[0];
-      const m2 = state.modelShoulders[1];
-      const shoulderY = (m1.y + m2.y) * 0.5;
-      const clipPct = clamp(((shoulderY + 28) / FRAME_H) * 100, 15, 97);
-      personImg.style.clipPath = `polygon(0 0, 100% 0, 100% ${clipPct}%, 0 ${clipPct}%)`;
-
       setShowUserMarkerModal(false);
       setHasUserImage(true);
-      setHintText(
-        'Applied. Drag on the card to move your photo; scroll to zoom. Mark Garment to recalibrate.',
-      );
     });
   };
 
@@ -1401,69 +1436,86 @@ export function TryOnPreviewCard({
           onDragOver={(event) => event.preventDefault()}
           onDrop={handleFrameDrop}
         >
-          <div id="hint" className="hint">
-            {hintText}
-          </div>
-
-          <div className="drop-note" style={{ opacity: hasUserImage ? 0 : 1 }}>
-            Drop image here or upload
-          </div>
-
-          <img id="person-img" ref={personImgRef} alt="User" />
-          <canvas id="garment-canvas" ref={garmentCanvasRef} width={FRAME_W} height={FRAME_H} />
-          <canvas id="pick-canvas" ref={pickCanvasRef} width={FRAME_W} height={FRAME_H} />
-
-          {hasUserImage && !showUserMarkerModal && !isMarkingGarment && (
-            <div
-              ref={tryOnInteractRef}
-              className="tryon-user-adjust-layer absolute inset-0 z-[3]"
-              onPointerDown={handleTryOnPointerDown}
-              onPointerMove={handleTryOnPointerMove}
-              onPointerUp={handleTryOnPointerUp}
-              onPointerCancel={handleTryOnPointerUp}
-              aria-hidden
+          {dressRecoloringMode ? (
+            <DressRecolorWorkflow
+              active={dressRecoloringMode}
+              sourceFile={dressRecolorSource?.file ?? null}
+              sourceObjectUrl={dressRecolorSource?.url ?? null}
+              garmentColor={garmentColor ?? '#a09998'}
             />
-          )}
+          ) : (
+            <>
+              <img
+                id="person-img"
+                ref={personImgRef}
+                alt="Your try-on photo"
+                onLoad={() => {
+                  const el = personImgRef.current;
+                  if (!el || el.naturalWidth < 1) {
+                    return;
+                  }
+                  el.style.width = `${el.naturalWidth}px`;
+                  el.style.height = `${el.naturalHeight}px`;
+                  applyImageTransform();
+                }}
+              />
+              <canvas id="garment-canvas" ref={garmentCanvasRef} width={FRAME_W} height={FRAME_H} />
+              <canvas id="pick-canvas" ref={pickCanvasRef} width={FRAME_W} height={FRAME_H} />
 
-          {isMarkingGarment && (
-            <div className="absolute inset-0 z-[6] cursor-crosshair" onClick={handleFrameClick} />
-          )}
-
-          {onToggleColorLike && (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                onToggleColorLike();
-              }}
-              className="tryon-like-btn"
-              aria-label={isColorLiked ? 'Remove selected shade from recommended shades' : 'Add selected shade to recommended shades'}
-              title={isColorLiked ? 'Saved to recommended shades' : 'Save selected shade'}
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path
-                  d="M12 21s-6.5-4.35-9.33-8.04C0.29 9.86 1.05 5.5 4.82 4.21c2.24-.77 4.1.17 5.18 1.68 1.08-1.51 2.94-2.45 5.18-1.68 3.77 1.29 4.53 5.65 2.15 8.75C18.5 16.65 12 21 12 21z"
-                  fill={isColorLiked ? '#f9739b' : 'none'}
-                  stroke={isColorLiked ? '#f9739b' : '#ffffff'}
-                  strokeWidth="1.7"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              {hasUserImage && !showUserMarkerModal && !isMarkingGarment && (
+                <div
+                  ref={tryOnInteractRef}
+                  className="tryon-user-adjust-layer absolute inset-0 z-[4]"
+                  onPointerDown={handleTryOnPointerDown}
+                  onPointerMove={handleTryOnPointerMove}
+                  onPointerUp={handleTryOnPointerUp}
+                  onPointerCancel={handleTryOnPointerUp}
+                  aria-hidden
                 />
-              </svg>
-            </button>
+              )}
+
+              {isMarkingGarment && (
+                <div className="absolute inset-0 z-[6] cursor-crosshair" onClick={handleFrameClick} />
+              )}
+
+              {onToggleColorLike && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleColorLike();
+                  }}
+                  className="tryon-like-btn"
+                  data-liked={isColorLiked ? 'true' : 'false'}
+                  aria-label={isColorLiked ? 'Remove selected shade from recommended shades' : 'Add selected shade to recommended shades'}
+                  title={isColorLiked ? 'Saved to recommended shades' : 'Save selected shade'}
+                >
+                  <svg
+                    width="22"
+                    height="22"
+                    viewBox="0 -2 32 32"
+                    fill="none"
+                    xmlns="http://www.w3.org/2000/svg"
+                    aria-hidden="true"
+                  >
+                    <g transform="translate(-3)">
+                      <path
+                        d="M26,4c2.757,0,5,2.692,5,6,0,6.308-7.637,11.425-12,13.6C14.632,21.422,7,16.307,7,10c0-3.308,2.243-6,5-6a5.033,5.033,0,0,1,3.765,2.353l1.618,1.772a2,2,0,0,0,3.234,0l1.618-1.772A5.033,5.033,0,0,1,26,4m0-4a8.961,8.961,0,0,0-7,4,8.961,8.961,0,0,0-7-4C7.029,0,3,4.477,3,10,3,21.438,19,28,19,28s16-6.562,16-18c0-5.523-4.029-10-9-10Z"
+                        fill={isColorLiked ? '#dc2626' : 'none'}
+                        stroke={isColorLiked ? 'none' : '#0a0a0a'}
+                        strokeWidth={isColorLiked ? 0 : 1.15}
+                        strokeLinejoin="round"
+                      />
+                    </g>
+                  </svg>
+                </button>
+              )}
+            </>
           )}
 
           {showUserMarkerModal && uploadedImage && (
             <div className="absolute inset-0 z-50 flex items-center justify-center bg-[rgba(17,16,25,0.55)] p-4">
               <div className="flex w-full max-w-[400px] flex-col gap-4 rounded-[20px] border border-[rgba(158,106,255,0.22)] bg-white p-5 shadow-[0_20px_44px_-22px_rgba(26,14,53,0.55)]">
-                <p className="px-1 text-center font-['Cabin:Bold',sans-serif] text-[13px] leading-snug text-[#4b4662]">
-                  {isCropMode
-                    ? 'Drag across your photo to select the region, then tap Apply Crop.'
-                    : userPhotoStep === 'crop-or-skip'
-                      ? 'Step 1 of 2: Optionally crop. Tap Crop, drag a box, then Apply Crop — or use the full image.'
-                      : 'Step 2 of 2: Tap your LEFT shoulder, then your RIGHT shoulder (same order as on the garment).'}
-                </p>
-
                 <div
                   ref={markerViewportRef}
                   className="mx-auto flex w-full max-w-[320px] justify-center rounded-[14px] border border-[rgba(158,106,255,0.28)] bg-[#f4f1fc] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)]"
@@ -1481,7 +1533,23 @@ export function TryOnPreviewCard({
                             ? 'cursor-pointer'
                             : 'cursor-default'
                       }`}
-                      onLoad={() => setLayoutTick((t) => t + 1)}
+                      onLoad={(event) => {
+                        const el = event.currentTarget;
+                        setLayoutTick((t) => t + 1);
+                        setUploadedImage((prev) => {
+                          if (!prev || prev.src !== el.src) {
+                            return prev;
+                          }
+                          if (prev.naturalWidth === el.naturalWidth && prev.naturalHeight === el.naturalHeight) {
+                            return prev;
+                          }
+                          return {
+                            ...prev,
+                            naturalWidth: el.naturalWidth,
+                            naturalHeight: el.naturalHeight,
+                          };
+                        });
+                      }}
                       onClick={handleUserMarkerClick}
                     />
 
@@ -1582,21 +1650,36 @@ export function TryOnPreviewCard({
         onChange={handleUploadImage}
       />
 
-      <div className="absolute left-0 top-[578px] z-40 flex w-[420px] items-center justify-center gap-3">
-        <button
-          type="button"
-          onClick={handleMarkGarment}
-          className="rounded-full border border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] text-[#46425e] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)]"
-        >
-          Mark Garment
-        </button>
+      <div className="absolute left-0 top-[578px] z-40 flex w-[420px] flex-wrap items-center justify-center gap-2 px-1">
+        {!dressRecoloringMode && (
+          <button
+            type="button"
+            onClick={handleMarkGarment}
+            className="rounded-full border border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] text-[#46425e] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)]"
+          >
+            Mark Garment
+          </button>
+        )}
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={!hasGarmentShoulders}
+          disabled={!dressRecoloringMode && !hasGarmentShoulders}
           className="rounded-full border border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] text-[#46425e] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)] disabled:cursor-not-allowed disabled:opacity-45"
         >
           Upload User Image
+        </button>
+        <button
+          type="button"
+          onClick={() => onDressRecoloringModeChange(!dressRecoloringMode)}
+          aria-pressed={dressRecoloringMode}
+          className={`rounded-full border px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)] ${
+            dressRecoloringMode
+              ? 'border-[#9e6aff] bg-[rgba(158,106,255,0.14)] text-[#5c3eb8]'
+              : 'border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] text-[#46425e]'
+          }`}
+          title={dressRecoloringMode ? 'Return to virtual try-on' : 'Empty preview and upload a user image'}
+        >
+          Dress recoloring
         </button>
       </div>
     </div>

@@ -8,6 +8,7 @@ import type { Texture } from 'three';
 import type { ElementType, ErrorInfo, ReactNode } from 'react';
 import { GarmentViewerSimple } from './GarmentViewerSimple';
 import type { FabricOption } from '../types/fabric';
+import { ensureMeshUv2ForAoMap } from '../utils/ensureMeshUv2';
 
 const R3fGroup = 'group' as unknown as ElementType;
 const R3fPrimitive = 'primitive' as unknown as ElementType;
@@ -127,16 +128,6 @@ function isFabricMesh(mesh: Mesh): boolean {
 
   // Many garment GLBs use generic node names; any primary textured surface with UVs is treated as fabric.
   return hasUv;
-}
-
-function ensureUv2(mesh: Mesh) {
-  const geometry = mesh.geometry;
-  if (!geometry || geometry.attributes.uv2 || !geometry.attributes.uv) {
-    return;
-  }
-
-  // AO maps in MeshStandardMaterial need UV2; copy UV1 when the GLB omits it.
-  geometry.setAttribute('uv2', geometry.attributes.uv.clone());
 }
 
 function configureTexture(texture: Texture, repeat: [number, number], isColorTexture = false) {
@@ -278,6 +269,41 @@ function applyColorToMaterial(material: Material | Material[], color: Color) {
       colorMaterial.color.copy(color);
       colorMaterial.needsUpdate = true;
     }
+  });
+}
+
+/**
+ * Neckline thumbnails use `applyFabricTextures={false}` and only set `material.color`. For
+ * MeshStandardMaterial / PhysicalMaterial, the renderer still multiplies albedo by `map`, so a
+ * GLB with a dark or colored base-color texture (e.g. maroon puffer) never matches the UI swatch.
+ */
+function stripAlbedoMapsForSolidSwatch(material: Material | Material[]) {
+  const materials = Array.isArray(material) ? material : [material];
+  materials.forEach((entry) => {
+    const m = entry as Material & {
+      map?: Texture | null;
+      lightMap?: Texture | null;
+      emissiveMap?: Texture | null;
+      emissive?: Color;
+      emissiveIntensity?: number;
+      needsUpdate?: boolean;
+    };
+    if (m.map) {
+      m.map = null;
+    }
+    if (m.lightMap) {
+      m.lightMap = null;
+    }
+    if (m.emissiveMap) {
+      m.emissiveMap = null;
+    }
+    if (m.emissive) {
+      m.emissive.setHex(0x000000);
+    }
+    if (typeof m.emissiveIntensity === 'number') {
+      m.emissiveIntensity = 0;
+    }
+    m.needsUpdate = true;
   });
 }
 
@@ -588,18 +614,20 @@ function GarmentModel({
 
     root.traverse((obj) => {
       const mesh = obj as Mesh;
-      if (!mesh.isMesh || !mesh.material) {
+      if (!mesh.isMesh) {
         return;
       }
 
-      if (Array.isArray(mesh.material)) {
-        mesh.material = mesh.material.map((material) => material.clone());
-      } else {
-        mesh.material = mesh.material.clone();
+      if (mesh.material) {
+        if (Array.isArray(mesh.material)) {
+          mesh.material = mesh.material.map((material) => material.clone());
+        } else {
+          mesh.material = mesh.material.clone();
+        }
+        mesh.userData.originalMaterial = mesh.material;
       }
 
-      mesh.userData.originalMaterial = mesh.material;
-      ensureUv2(mesh);
+      ensureMeshUv2ForAoMap(mesh);
     });
 
     const box = computeRobustMeshBounds(root);
@@ -696,6 +724,9 @@ function GarmentModel({
       const originalMaterial = mesh.userData.originalMaterial as Material | Material[] | undefined;
       if (originalMaterial) {
         applyColorToMaterial(originalMaterial, tintColor);
+        if (!effectiveFabric) {
+          stripAlbedoMapsForSolidSwatch(originalMaterial);
+        }
       }
     });
 
@@ -723,6 +754,11 @@ function GarmentModel({
       warnedLowPolyRef.current = true;
     }
 
+    meshSelection.fabricMeshes.forEach((m) => ensureMeshUv2ForAoMap(m));
+
+    const missingUv2 = meshSelection.fabricMeshes.some((m) => !m.geometry?.attributes?.uv2);
+    const aoTex = missingUv2 ? null : fabricTextureSet.aoMap;
+
     const material = new MeshStandardMaterial({
       // Albedo from fabric color map, tinted by garment swatch (map × color in Three.js).
       map: fabricTextureSet.colorMap,
@@ -732,8 +768,8 @@ function GarmentModel({
       roughness: 1.0,
       displacementMap: lowPoly ? null : fabricTextureSet.displacementMap,
       displacementScale: lowPoly ? 0 : 0.02,
-      aoMap: fabricTextureSet.aoMap,
-      aoMapIntensity: fabricTextureSet.aoMap ? 1.0 : 0,
+      aoMap: aoTex,
+      aoMapIntensity: aoTex ? 1.0 : 0,
       metalness: 0.05,
       color: tintColor,
     });

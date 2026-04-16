@@ -5,7 +5,7 @@ import { NecklineTesting } from "../../app/components/NecklineTesting";
 import { TryOnPreviewCard } from "../../app/components/TryOnPreviewCard";
 import { garmentStyles } from "../../app/config/garmentStyles";
 import type { FabricOption } from "../../app/types/fabric";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const PALETTE_COLORS = [
   "#fffffa", "#fffff0", "#f0eada", "#e3dac9", "#c7bba4", "#d7d2cb", "#cac1b4", "#c0b5aa",
@@ -393,12 +393,16 @@ function Container8({
   selectedFabricTexture,
   isSelectedColorRecommended,
   onToggleSelectedColorRecommendation,
+  dressRecoloringMode,
+  onDressRecoloringModeChange,
 }: {
   selectedGarmentId: string;
   selectedColor: string;
   selectedFabricTexture?: FabricOption;
   isSelectedColorRecommended: boolean;
   onToggleSelectedColorRecommendation: () => void;
+  dressRecoloringMode: boolean;
+  onDressRecoloringModeChange: (next: boolean) => void;
 }) {
   return (
     <TryOnPreviewCard
@@ -407,6 +411,8 @@ function Container8({
       selectedFabric={selectedFabricTexture}
       isColorLiked={isSelectedColorRecommended}
       onToggleColorLike={onToggleSelectedColorRecommendation}
+      dressRecoloringMode={dressRecoloringMode}
+      onDressRecoloringModeChange={onDressRecoloringModeChange}
     />
   );
 }
@@ -914,6 +920,8 @@ function Container({
   onFabricSelect,
   isSelectedColorRecommended,
   onToggleSelectedColorRecommendation,
+  dressRecoloringMode,
+  onDressRecoloringModeChange,
 }: {
   selectedGarmentId: string;
   onGarmentSelect: (garmentId: string) => void;
@@ -922,6 +930,8 @@ function Container({
   onFabricSelect: (fabric: FabricOption) => void;
   isSelectedColorRecommended: boolean;
   onToggleSelectedColorRecommendation: () => void;
+  dressRecoloringMode: boolean;
+  onDressRecoloringModeChange: (next: boolean) => void;
 }) {
   return (
     <div
@@ -936,6 +946,8 @@ function Container({
         selectedFabricTexture={selectedFabricTexture}
         isSelectedColorRecommended={isSelectedColorRecommended}
         onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
+        dressRecoloringMode={dressRecoloringMode}
+        onDressRecoloringModeChange={onDressRecoloringModeChange}
       />
       <NecklineTesting
         selectedGarmentId={selectedGarmentId}
@@ -2704,6 +2716,8 @@ function Ty({
   onToggleSelectedColorRecommendation,
   recommendedShades,
   onClearRecommendedShades,
+  dressRecoloringMode,
+  onDressRecoloringModeChange,
 }: {
   mainSeason: string;
   selectedGarmentId: string;
@@ -2716,6 +2730,8 @@ function Ty({
   onToggleSelectedColorRecommendation: () => void;
   recommendedShades: string[];
   onClearRecommendedShades: () => void;
+  dressRecoloringMode: boolean;
+  onDressRecoloringModeChange: (next: boolean) => void;
 }) {
   return (
     <div
@@ -2730,6 +2746,8 @@ function Ty({
         onFabricSelect={onFabricSelect}
         isSelectedColorRecommended={isSelectedColorRecommended}
         onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
+        dressRecoloringMode={dressRecoloringMode}
+        onDressRecoloringModeChange={onDressRecoloringModeChange}
       />
       <SeasonSelectorPanel mainSeason={mainSeason} />
       <Container33
@@ -2754,6 +2772,8 @@ function Body({
   onToggleSelectedColorRecommendation,
   recommendedShades,
   onClearRecommendedShades,
+  dressRecoloringMode,
+  onDressRecoloringModeChange,
 }: {
   mainSeason: string;
   selectedGarmentId: string;
@@ -2766,6 +2786,8 @@ function Body({
   onToggleSelectedColorRecommendation: () => void;
   recommendedShades: string[];
   onClearRecommendedShades: () => void;
+  dressRecoloringMode: boolean;
+  onDressRecoloringModeChange: (next: boolean) => void;
 }) {
   return (
     <div
@@ -2784,6 +2806,8 @@ function Body({
         onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
         recommendedShades={recommendedShades}
         onClearRecommendedShades={onClearRecommendedShades}
+        dressRecoloringMode={dressRecoloringMode}
+        onDressRecoloringModeChange={onDressRecoloringModeChange}
       />
     </div>
   );
@@ -3032,9 +3056,15 @@ function Header({
 export default function ColorAnalysis() {
   const [mainSeason, setMainSeason] = useState("Spring");
   const [selectedGarmentId, setSelectedGarmentId] = useState(garmentStyles[0]?.id ?? "");
+  const [dressRecoloringMode, setDressRecoloringMode] = useState(false);
   const [selectedColor, setSelectedColor] = useState("#a09998");
   const [selectedFabricTexture, setSelectedFabricTexture] = useState<FabricOption | undefined>(DEFAULT_FABRIC);
   const [recommendedShades, setRecommendedShades] = useState<string[]>(loadRecommendedShadesFromStorage);
+
+  const handleGarmentSelect = useCallback((garmentId: string) => {
+    setSelectedGarmentId(garmentId);
+    setDressRecoloringMode(false);
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -3078,7 +3108,7 @@ export default function ColorAnalysis() {
       <Body
         mainSeason={mainSeason}
         selectedGarmentId={selectedGarmentId}
-        onGarmentSelect={setSelectedGarmentId}
+        onGarmentSelect={handleGarmentSelect}
         selectedColor={selectedColor}
         selectedFabricTexture={selectedFabricTexture}
         onFabricSelect={setSelectedFabricTexture}
@@ -3087,6 +3117,8 @@ export default function ColorAnalysis() {
         onToggleSelectedColorRecommendation={handleToggleSelectedColorRecommendation}
         recommendedShades={recommendedShades}
         onClearRecommendedShades={handleClearRecommendedShades}
+        dressRecoloringMode={dressRecoloringMode}
+        onDressRecoloringModeChange={setDressRecoloringMode}
       />
       <Header
         mainSeason={mainSeason}
