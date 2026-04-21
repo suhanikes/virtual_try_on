@@ -1,30 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { DressRecolorLassoCanvas } from './DressRecolorLassoCanvas';
-import { DRESS_RECOLOR_API_BASE, uploadImage, lassoSegmentation, type LassoPoint } from './dressRecolorApi';
-import { recolorGarmentOKLCH, rgbToOKLCH, rgbToHex, oklchToRGB, type OKLCH } from './oklchRecolor';
-
-function parseHexToRgb(color: string): { r: number; g: number; b: number } {
-  const s = color.trim();
-  if (!s.startsWith('#')) {
-    return { r: 160, g: 153, b: 152 };
-  }
-  const h = s.slice(1);
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  if (full.length !== 6 || !/^[0-9a-fA-F]{6}$/.test(full)) {
-    return { r: 160, g: 153, b: 152 };
-  }
-  return {
-    r: parseInt(full.slice(0, 2), 16),
-    g: parseInt(full.slice(2, 4), 16),
-    b: parseInt(full.slice(4, 6), 16),
-  };
-}
+import {
+  DRESS_RECOLOR_API_BASE,
+  uploadImage,
+  lassoSegmentation,
+  type LassoPoint,
+} from './dressRecolorApi';
+import { b64ToUint8Mask, recolorGarmentOKLCH } from './oklchRecolor';
 
 type Props = {
   active: boolean;
@@ -51,8 +33,45 @@ export function DressRecolorWorkflow({
   const baseCanvasRef = useRef<HTMLCanvasElement>(null);
   const baseImageDataRef = useRef<ImageData | null>(null);
   const uploadSeqRef = useRef(0);
+  const previewHistoryRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1);
+  const [historyVersion, setHistoryVersion] = useState(0);
 
-  const targetOKLCH = useMemo<OKLCH>(() => rgbToOKLCH(parseHexToRgb(garmentColor)), [garmentColor]);
+  const canUndo = historyVersion >= 0 && historyIndexRef.current > 0;
+  const canRedo =
+    historyVersion >= 0 &&
+    historyIndexRef.current >= 0 &&
+    historyIndexRef.current < previewHistoryRef.current.length - 1;
+
+  const pushHistory = useCallback((nextUrl: string) => {
+    const current = previewHistoryRef.current[historyIndexRef.current] ?? null;
+    if (current === nextUrl) {
+      return;
+    }
+    const trimmed = previewHistoryRef.current.slice(0, historyIndexRef.current + 1);
+    trimmed.push(nextUrl);
+    previewHistoryRef.current = trimmed;
+    historyIndexRef.current = trimmed.length - 1;
+    setHistoryVersion((v) => v + 1);
+  }, []);
+
+  const undoPreview = useCallback(() => {
+    if (historyIndexRef.current <= 0) {
+      return;
+    }
+    historyIndexRef.current -= 1;
+    setRecolorPreviewUrl(previewHistoryRef.current[historyIndexRef.current] ?? null);
+    setHistoryVersion((v) => v + 1);
+  }, []);
+
+  const redoPreview = useCallback(() => {
+    if (historyIndexRef.current >= previewHistoryRef.current.length - 1) {
+      return;
+    }
+    historyIndexRef.current += 1;
+    setRecolorPreviewUrl(previewHistoryRef.current[historyIndexRef.current] ?? null);
+    setHistoryVersion((v) => v + 1);
+  }, []);
 
   useEffect(() => {
     if (active) {
@@ -63,6 +82,9 @@ export function DressRecolorWorkflow({
     setLastLassoPoints(null);
     setRecolorPreviewUrl(null);
     setWorkflowError(null);
+    previewHistoryRef.current = [];
+    historyIndexRef.current = -1;
+    setHistoryVersion((v) => v + 1);
     baseImageDataRef.current = null;
     if (colorDebounceRef.current) {
       clearTimeout(colorDebounceRef.current);
@@ -81,6 +103,9 @@ export function DressRecolorWorkflow({
     setLastLassoPoints(null);
     setMaskPreview(null);
     baseImageDataRef.current = null;
+    previewHistoryRef.current = [];
+    historyIndexRef.current = -1;
+    setHistoryVersion((v) => v + 1);
     setWorkflowError(null);
 
     setIsUploading(true);
@@ -129,7 +154,7 @@ export function DressRecolorWorkflow({
         const detail =
           ax.response?.data?.error ?? ax.response?.data?.details ?? ax.message ?? 'Upload failed';
         const hint = isNetwork
-          ? `Cannot reach ${DRESS_RECOLOR_API_BASE}. Start the dress recolor backend: cd "dress-recolor-backend" then npm run start. Also start the ML service on port 8000. Or set VITE_DRESS_RECOLOR_API_URL in .env and restart Vite.`
+          ? `Cannot reach ${DRESS_RECOLOR_API_BASE}. Start the dress recolor backend: cd "dress-recolor-backend" then npm run start. If needed, set VITE_DRESS_RECOLOR_API_URL in .env and restart Vite.`
           : '';
         setWorkflowError(hint ? `${detail}. ${hint}` : detail);
         setImageId(null);
@@ -142,7 +167,7 @@ export function DressRecolorWorkflow({
   }, [active, sourceFile, sourceObjectUrl]);
 
   const runRecolor = useCallback(
-    async (lassoPoints: LassoPoint[], lch: OKLCH) => {
+    async (lassoPoints: LassoPoint[], selectedPaletteHex: string) => {
       if (!imageId || !lassoPoints || lassoPoints.length < 3) {
         return;
       }
@@ -152,7 +177,7 @@ export function DressRecolorWorkflow({
         const res = await lassoSegmentation({
           imageId,
           lassoPoints,
-          selectedColor: rgbToHex(oklchToRGB(lch)),
+          selectedColor: selectedPaletteHex,
         });
         if (requestId !== recolorRequestIdRef.current) {
           return;
@@ -167,29 +192,24 @@ export function DressRecolorWorkflow({
           return;
         }
 
-        const b64ToUint8 = (b64: string) => {
-          const binary = atob(b64);
-          const len = binary.length;
-          const arr = new Uint8Array(len);
-          for (let i = 0; i < len; i++) {
-            arr[i] = binary.charCodeAt(i);
-          }
-          return arr;
-        };
-
         const { garment_mask_b64, height, width } = res;
         if (!garment_mask_b64 || height == null || width == null) {
           console.warn('Missing garment mask from backend response.');
           return;
         }
-        const maskArr = b64ToUint8(garment_mask_b64);
+        if (height !== baseImageData.height || width !== baseImageData.width) {
+          throw new Error(
+            `Mask dimensions (${width}x${height}) do not match image dimensions (${baseImageData.width}x${baseImageData.height}).`,
+          );
+        }
+        const maskArr = b64ToUint8Mask(garment_mask_b64);
 
         const result = recolorGarmentOKLCH(
           baseImageData.data,
           baseImageData.width,
           baseImageData.height,
           maskArr,
-          lch,
+          selectedPaletteHex,
         );
 
         const canvas = baseCanvasRef.current;
@@ -206,6 +226,7 @@ export function DressRecolorWorkflow({
         ctx.putImageData(outImageData, 0, 0);
         const url = canvas.toDataURL('image/png');
         setRecolorPreviewUrl(url);
+        pushHistory(url);
         setWorkflowError(null);
       } catch (err: unknown) {
         if (requestId !== recolorRequestIdRef.current) {
@@ -222,7 +243,7 @@ export function DressRecolorWorkflow({
           ax.code === 'ERR_NETWORK' ||
           (err instanceof Error && err.message.toLowerCase().includes('network'));
         const extra = isNetwork
-          ? ` Check that the API is running (${DRESS_RECOLOR_API_BASE}) and the ML service is on port 8000.`
+          ? ` Check that the API is running (${DRESS_RECOLOR_API_BASE}).`
           : '';
         setWorkflowError(details ? `${msg} — ${details}${extra}` : `${msg}${extra}`);
       } finally {
@@ -234,12 +255,38 @@ export function DressRecolorWorkflow({
     [imageId],
   );
 
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        undoPreview();
+        return;
+      }
+      if (key === 'y' || (key === 'z' && event.shiftKey)) {
+        event.preventDefault();
+        redoPreview();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [active, redoPreview, undoPreview]);
+
   const handleLassoComplete = useCallback(
     async (lassoPoints: LassoPoint[]) => {
       setLastLassoPoints(lassoPoints);
-      await runRecolor(lassoPoints, targetOKLCH);
+      await runRecolor(lassoPoints, garmentColor);
     },
-    [runRecolor, targetOKLCH],
+    [garmentColor, runRecolor],
   );
 
   useEffect(() => {
@@ -250,7 +297,7 @@ export function DressRecolorWorkflow({
       clearTimeout(colorDebounceRef.current);
     }
     colorDebounceRef.current = setTimeout(() => {
-      void runRecolor(lastLassoPoints, targetOKLCH);
+      void runRecolor(lastLassoPoints, garmentColor);
       colorDebounceRef.current = null;
     }, 400);
     return () => {
@@ -258,9 +305,9 @@ export function DressRecolorWorkflow({
         clearTimeout(colorDebounceRef.current);
       }
     };
-    // Intentionally omit lastLassoPoints: only re-run when panel color (targetOKLCH) or API id changes, matching ai model app.
+    // Intentionally omit lastLassoPoints: only re-run when panel color or API id changes, matching ai model app.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [garmentColor, imageId, runRecolor, targetOKLCH]);
+  }, [garmentColor, imageId, runRecolor]);
 
   const displayUrl = recolorPreviewUrl ?? sourceObjectUrl;
 
@@ -276,6 +323,24 @@ export function DressRecolorWorkflow({
         />
       </div>
       <div className="shrink-0 px-1 pt-2">
+        <div className="mb-2 flex items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={undoPreview}
+            disabled={!canUndo}
+            className="rounded-full border border-[rgba(158,106,255,0.45)] bg-white px-3 py-1 text-[10px] font-['Cabin:Semibold',sans-serif] text-[#6e5a9a] disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            Undo
+          </button>
+          <button
+            type="button"
+            onClick={redoPreview}
+            disabled={!canRedo}
+            className="rounded-full border border-[rgba(158,106,255,0.45)] bg-white px-3 py-1 text-[10px] font-['Cabin:Semibold',sans-serif] text-[#6e5a9a] disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            Redo
+          </button>
+        </div>
         {isUploading && (
           <p className="text-center font-['Cabin:Semibold',sans-serif] text-[10px] text-[#6e5a9a]">
             Uploading…

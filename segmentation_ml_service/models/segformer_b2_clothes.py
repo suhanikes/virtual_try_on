@@ -71,3 +71,25 @@ def run_segmentation_on_image(image_bgr: np.ndarray) -> np.ndarray:
         interpolation=cv2.INTER_NEAREST,
     )
     return seg_orig
+
+
+def preload_segformer_model() -> None:
+    """Load model weights into memory and place model on target device."""
+    _load_model()
+
+
+def warmup_segformer_model() -> None:
+    """Run one tiny forward pass so first real request has lower latency."""
+    processor, model = _load_model()
+    device = next(model.parameters()).device
+
+    dummy = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+    inputs = processor(images=dummy, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        _ = model(**inputs)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    log.info("SegFormer warmup forward pass in %.1f s", time.perf_counter() - t0)

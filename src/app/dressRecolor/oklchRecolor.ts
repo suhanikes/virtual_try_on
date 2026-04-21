@@ -1,36 +1,33 @@
-export type RGB = {
-  r: number;
-  g: number;
-  b: number;
-};
+export type RGB = { r: number; g: number; b: number };
+export type OKLab = { L: number; a: number; b: number };
+export type OKLCH = { L: number; C: number; h: number };
 
-export type OKLab = {
-  L: number;
-  a: number;
-  b: number;
-};
+export interface RecolorResult {
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+  previewHex?: string;
+}
 
-export type OKLCH = {
-  L: number;
-  C: number;
-  h: number;
-};
+const MIN_CHROMA_FOR_HUE = 0.03;
+const NEAR_NEUTRAL_DARK_MEAN_C_THRESHOLD = 0.06;
+const NEUTRAL_TARGET_CHROMA_THRESHOLD = 0.08;
+const WHITE_LIGHTNESS_THRESHOLD = 0.9;
 
-export type DominanceScores = {
-  L: number;
-  C: number;
-  H: number;
-  primary: "L" | "C" | "H";
-  secondary: "L" | "C" | "H";
-};
+function clamp(v: number, min: number, max: number): number {
+  return v < min ? min : v > max ? max : v;
+}
 
-// === sRGB -> Linear
 function srgbToLinear(value: number): number {
-  const v = Math.max(0, Math.min(255, value)) / 255;
+  const v = clamp(value, 0, 255) / 255;
   return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
 }
 
-// === RGB -> OKLab
+function linearToSrgb(value: number): number {
+  const v = clamp(value, 0, 1);
+  return v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+}
+
 export function rgbToOKLab(rgb: RGB): OKLab {
   const r = srgbToLinear(rgb.r);
   const g = srgbToLinear(rgb.g);
@@ -66,11 +63,12 @@ export function rgbToOKLCH(rgb: RGB): OKLCH {
 }
 
 export function okLCHToOKLab(lch: OKLCH): OKLab {
-  const { L, C, h } = lch;
-  const hRad = (h * Math.PI) / 180;
-  const a = C * Math.cos(hRad);
-  const b = C * Math.sin(hRad);
-  return { L, a, b };
+  const hRad = (lch.h * Math.PI) / 180;
+  return {
+    L: lch.L,
+    a: lch.C * Math.cos(hRad),
+    b: lch.C * Math.sin(hRad),
+  };
 }
 
 export function okLabToRGB(oklab: OKLab): RGB {
@@ -86,15 +84,10 @@ export function okLabToRGB(oklab: OKLab): RGB {
   const g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
   const b = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
 
-  const linearToSRGB = (value: number): number => {
-    const v = Math.max(0, Math.min(1, value));
-    return v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
-  };
-
   return {
-    r: Math.round(linearToSRGB(r) * 255),
-    g: Math.round(linearToSRGB(g) * 255),
-    b: Math.round(linearToSRGB(b) * 255),
+    r: Math.round(linearToSrgb(r) * 255),
+    g: Math.round(linearToSrgb(g) * 255),
+    b: Math.round(linearToSrgb(b) * 255),
   };
 }
 
@@ -103,59 +96,29 @@ export function oklchToRGB(lch: OKLCH): RGB {
 }
 
 export function rgbToHex(rgb: RGB): string {
-  const toHex = (n: number) => {
-    const clamped = Math.max(0, Math.min(255, Math.round(n)));
-    return clamped.toString(16).padStart(2, "0");
-  };
+  const toHex = (n: number) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0");
   return `#${toHex(rgb.r)}${toHex(rgb.g)}${toHex(rgb.b)}`;
 }
 
-// Dominance scoring
-const L_NEUTRAL = 0.65;
-const C_NEUTRAL = 0.1;
-const H_WARM_CENTER = 50;
-const H_COOL_CENTER = 230;
-
-function hueDistance(h1: number, h2: number): number {
-  const diff = Math.abs(h1 - h2);
-  return Math.min(diff, 360 - diff);
-}
-
-export function computeDominanceScores(lch: OKLCH): DominanceScores {
-  const lScore = Math.abs(lch.L - L_NEUTRAL);
-  const cScore = Math.abs(lch.C - C_NEUTRAL);
-  const warmDist = hueDistance(lch.h, H_WARM_CENTER);
-  const coolDist = hueDistance(lch.h, H_COOL_CENTER);
-  const hScore = Math.max(1 - warmDist / 180, 1 - coolDist / 180);
-
-  const rawScores = { L: lScore, C: cScore, H: hScore };
-  const sorted = Object.entries(rawScores)
-    .sort((a, b) => b[1] - a[1])
-    .map((entry) => entry[0]) as ("L" | "C" | "H")[];
-
+export function hexToRgb(hex: string): RGB {
+  const h = hex.replace("#", "").trim();
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) {
+    throw new Error("Hex color must be 6 chars like #ff3366");
+  }
   return {
-    L: rawScores.L,
-    C: rawScores.C,
-    H: rawScores.H,
-    primary: sorted[0],
-    secondary: sorted[1],
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
   };
 }
 
-export interface RecolorResult {
-  data: Uint8ClampedArray;
-  width: number;
-  height: number;
-  previewHex?: string;
+export function b64ToUint8Mask(maskB64: string): Uint8Array {
+  const binary = atob(maskB64);
+  const len = binary.length;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) out[i] = binary.charCodeAt(i);
+  return out;
 }
-
-function clamp(value: number, min: number, max: number): number {
-  return value < min ? min : value > max ? max : value;
-}
-
-const MIN_CHROMA_FOR_HUE = 0.03;
-const DARK_GARMENT_MEAN_L_THRESHOLD = 0.42;
-const NEAR_NEUTRAL_DARK_MEAN_C_THRESHOLD = 0.06;
 
 function computeMaskedMeanLCH(
   srcData: Uint8ClampedArray,
@@ -196,7 +159,37 @@ function computeMaskedMeanLCH(
   const meanC = sumC / count;
   let meanH = hueCount > 0 ? (Math.atan2(sumSin, sumCos) * 180) / Math.PI : 0;
   if (meanH < 0) meanH += 360;
+
   return { L: meanL, C: meanC, h: meanH };
+}
+
+function computeMaskedLightnessRange(
+  srcData: Uint8ClampedArray,
+  mask: Uint8Array | Uint8ClampedArray,
+  pixelCount: number,
+): { minL: number; maxL: number } {
+  let minL = 1;
+  let maxL = 0;
+  let found = false;
+
+  for (let i = 0; i < pixelCount; i++) {
+    if (mask[i] === 0) continue;
+    const idx = i * 4;
+    const lch = rgbToOKLCH({
+      r: srcData[idx],
+      g: srcData[idx + 1],
+      b: srcData[idx + 2],
+    });
+    if (lch.L < minL) minL = lch.L;
+    if (lch.L > maxL) maxL = lch.L;
+    found = true;
+  }
+
+  if (!found) {
+    return { minL: 0, maxL: 0 };
+  }
+
+  return { minL, maxL };
 }
 
 export function recolorGarmentOKLCH(
@@ -204,40 +197,31 @@ export function recolorGarmentOKLCH(
   width: number,
   height: number,
   mask: Uint8Array | Uint8ClampedArray,
-  target: RGB | string | OKLCH,
+  target: string | RGB | OKLCH,
 ): RecolorResult {
   const pixelCount = width * height;
-  if (srcData.length !== pixelCount * 4) {
-    throw new Error("srcData length does not match width * height * 4");
-  }
-  if (mask.length !== pixelCount) {
-    throw new Error("mask length does not match width * height");
-  }
+  if (srcData.length !== pixelCount * 4) throw new Error("srcData size mismatch");
+  if (mask.length !== pixelCount) throw new Error("mask size mismatch");
 
   const isOKLCH = (v: any): v is OKLCH =>
-    v && typeof v === "object" && typeof v.L === "number" && typeof v.C === "number" && typeof v.h === "number";
+    v && typeof v.L === "number" && typeof v.C === "number" && typeof v.h === "number";
 
   const targetLCH: OKLCH =
     typeof target === "string"
-      ? (() => {
-          const hex = target.replace("#", "");
-          const r = parseInt(hex.slice(0, 2), 16);
-          const g = parseInt(hex.slice(2, 4), 16);
-          const b = parseInt(hex.slice(4, 6), 16);
-          return rgbToOKLCH({ r, g, b });
-        })()
+      ? rgbToOKLCH(hexToRgb(target))
       : isOKLCH(target)
       ? target
       : rgbToOKLCH(target);
 
-  // Keep algorithm stable by clamping to the same ranges used during per-pixel adjustment.
   const targetHue = targetLCH.h;
   const targetChroma = clamp(targetLCH.C, 0, 0.4);
   const targetLightness = clamp(targetLCH.L, 0, 1);
-  const isVeryDarkTarget = targetLightness < 0.12; // Prevent "black becoming grey/white"
+  const neutralTarget = targetChroma <= NEUTRAL_TARGET_CHROMA_THRESHOLD;
+
   const sourceMeanLCH = computeMaskedMeanLCH(srcData, mask, pixelCount);
-  const isNearNeutralDarkGarment =
-    sourceMeanLCH.C < NEAR_NEUTRAL_DARK_MEAN_C_THRESHOLD;
+  const sourceLightnessRange = computeMaskedLightnessRange(srcData, mask, pixelCount);
+  const safeRange = Math.max(sourceLightnessRange.maxL - sourceLightnessRange.minL, 1e-6);
+  const isNearNeutralDarkGarment = sourceMeanLCH.C < NEAR_NEUTRAL_DARK_MEAN_C_THRESHOLD;
 
   const out = new Uint8ClampedArray(srcData.length);
 
@@ -247,58 +231,58 @@ export function recolorGarmentOKLCH(
   let garmentCount = 0;
 
   for (let i = 0; i < pixelCount; i++) {
-    const srcIndex = i * 4;
-    const r = srcData[srcIndex];
-    const g = srcData[srcIndex + 1];
-    const b = srcData[srcIndex + 2];
-    const a = srcData[srcIndex + 3];
+    const idx = i * 4;
+    const r = srcData[idx];
+    const g = srcData[idx + 1];
+    const b = srcData[idx + 2];
+    const a = srcData[idx + 3];
 
     if (mask[i] === 0) {
-      out[srcIndex] = r;
-      out[srcIndex + 1] = g;
-      out[srcIndex + 2] = b;
-      out[srcIndex + 3] = a;
+      out[idx] = r;
+      out[idx + 1] = g;
+      out[idx + 2] = b;
+      out[idx + 3] = a;
       continue;
     }
 
     const lch = rgbToOKLCH({ r, g, b });
-    // Unified recolor path for all garments: previously dark-garment-only logic.
-    // Preserve local texture via relative transforms.
-    const deltaL = lch.L - sourceMeanLCH.L;
-    lch.L = clamp(targetLightness + deltaL, 0, 1);
 
-    if (isNearNeutralDarkGarment) {
-      // Near-neutral garments have unreliable per-pixel chroma/hue.
-      // Keep hue uniform and modulate chroma mildly by local lightness contrast.
-      const lContrastFactor = clamp(
-        1 + (lch.L - targetLightness) * 0.8,
-        0.75,
-        1.25,
-      );
-      lch.C = clamp(targetChroma * lContrastFactor, 0, 0.4);
+    if (neutralTarget) {
+      const isWhiteLikeTarget = targetLightness >= WHITE_LIGHTNESS_THRESHOLD;
+      const normalizedL = clamp((lch.L - sourceLightnessRange.minL) / safeRange, 0, 1);
+      const darkestAllowed = isWhiteLikeTarget
+        ? clamp(targetLightness - 0.18, 0, 1)
+        : clamp(targetLightness - 0.2, 0, 1);
+      lch.L = clamp(darkestAllowed + normalizedL * (targetLightness - darkestAllowed), 0, 1);
+      const neutralChromaScale = isWhiteLikeTarget ? 0.12 : 0.25;
+      const neutralChromaCap = isWhiteLikeTarget ? 0.018 : 0.06;
+      lch.C = clamp(targetChroma * neutralChromaScale, 0, neutralChromaCap);
     } else {
-      // Chromatic garments: bounded chroma ratio keeps texture without noise.
-      const safeMeanC = sourceMeanLCH.C > 1e-6 ? sourceMeanLCH.C : 1e-6;
-      const chromaRatio = clamp(lch.C / safeMeanC, 0.55, 1.45);
-      lch.C = clamp(Math.max(0, targetChroma * chromaRatio), 0, 0.4);
+      const deltaL = lch.L - sourceMeanLCH.L;
+      lch.L = clamp(targetLightness + deltaL, 0, 1);
+
+      if (isNearNeutralDarkGarment) {
+        const lContrastFactor = clamp(1 + (lch.L - targetLightness) * 0.8, 0.75, 1.25);
+        lch.C = clamp(targetChroma * lContrastFactor, 0, 0.4);
+      } else {
+        const safeMeanC = sourceMeanLCH.C > 1e-6 ? sourceMeanLCH.C : 1e-6;
+        const chromaRatio = clamp(lch.C / safeMeanC, 0.55, 1.45);
+        lch.C = clamp(targetChroma * chromaRatio, 0, 0.4);
+      }
     }
 
-    // Force stable target hue to avoid per-pixel hue noise artifacts.
-    // Hue from near-achromatic pixels is unstable.
     lch.h = targetHue;
-    if (lch.C < MIN_CHROMA_FOR_HUE) {
-      lch.h = targetHue;
-    }
+    if (lch.C < MIN_CHROMA_FOR_HUE) lch.h = targetHue;
 
-    const newRGB = oklchToRGB(lch);
-    const nr = clamp(Math.round(newRGB.r), 0, 255);
-    const ng = clamp(Math.round(newRGB.g), 0, 255);
-    const nb = clamp(Math.round(newRGB.b), 0, 255);
+    const nrgb = oklchToRGB(lch);
+    const nr = clamp(Math.round(nrgb.r), 0, 255);
+    const ng = clamp(Math.round(nrgb.g), 0, 255);
+    const nb = clamp(Math.round(nrgb.b), 0, 255);
 
-    out[srcIndex] = nr;
-    out[srcIndex + 1] = ng;
-    out[srcIndex + 2] = nb;
-    out[srcIndex + 3] = a;
+    out[idx] = nr;
+    out[idx + 1] = ng;
+    out[idx + 2] = nb;
+    out[idx + 3] = a;
 
     sumR += nr;
     sumG += ng;
@@ -316,5 +300,23 @@ export function recolorGarmentOKLCH(
       : undefined;
 
   return { data: out, width, height, previewHex };
+}
+
+export function applyDressRecolorFromPalette(
+  imageData: ImageData,
+  garmentMaskB64: string,
+  selectedPaletteHex: string,
+): ImageData {
+  const mask = b64ToUint8Mask(garmentMaskB64);
+
+  const result = recolorGarmentOKLCH(
+    imageData.data,
+    imageData.width,
+    imageData.height,
+    mask,
+    selectedPaletteHex,
+  );
+
+  return new ImageData(result.data, result.width, result.height);
 }
 

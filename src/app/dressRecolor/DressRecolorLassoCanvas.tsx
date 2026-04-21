@@ -37,10 +37,15 @@ export function DressRecolorLassoCanvas({
 }: Props) {
   const image = useImage(imageUrl);
   const [points, setPoints] = useState<number[]>([]);
+  const pointsRef = useRef<number[]>([]);
   const [isDrawing, setIsDrawing] = useState(false);
   const stageRef = useRef<Konva.Stage>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ width: 360, height: 520 });
+
+  useEffect(() => {
+    pointsRef.current = points;
+  }, [points]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -101,30 +106,32 @@ export function DressRecolorLassoCanvas({
     if (!isDrawing || !image) {
       return;
     }
+
+    const capturedPoints = pointsRef.current;
     setIsDrawing(false);
-    setPoints((prev) => {
-      if (prev.length < 6) {
-        return [];
-      }
+    setPoints([]);
 
-      const stage = stageRef.current;
-      if (!stage) {
-        return [];
-      }
+    if (capturedPoints.length < 6) {
+      return;
+    }
 
-      const scaleX = image.width / stage.width();
-      const scaleY = image.height / stage.height();
+    const stage = stageRef.current;
+    if (!stage) {
+      return;
+    }
 
-      const lassoPoints: LassoPoint[] = [];
-      for (let i = 0; i < prev.length; i += 2) {
-        lassoPoints.push({
-          x: prev[i] * scaleX,
-          y: prev[i + 1] * scaleY,
-        });
-      }
-      onLassoComplete(lassoPoints);
-      return [];
-    });
+    const scaleX = image.width / stage.width();
+    const scaleY = image.height / stage.height();
+
+    const lassoPoints: LassoPoint[] = [];
+    for (let i = 0; i < capturedPoints.length; i += 2) {
+      lassoPoints.push({
+        x: capturedPoints[i] * scaleX,
+        y: capturedPoints[i + 1] * scaleY,
+      });
+    }
+
+    onLassoComplete(lassoPoints);
   }, [image, isDrawing, onLassoComplete]);
 
   const maskPreviewImage = useImage(maskPreview);

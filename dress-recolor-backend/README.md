@@ -4,8 +4,8 @@ This is a standalone backend for the **Dress recoloring** workflow. It is intent
 
 ## What it provides
 
-- `POST /api/upload`: stores an uploaded image and (optionally) runs one-time segmentation via the ML service.
-- `POST /api/lasso-segmentation`: combines the stored segmentation + user lasso to produce a final garment mask.
+- `POST /api/upload`: stores an uploaded image and runs one-time segmentation via Hugging Face API.
+- `POST /api/lasso-segmentation`: combines stored HF segmentation + user lasso to produce a final garment mask.
 - `GET /health`
 
 ## How to run
@@ -27,10 +27,7 @@ npm run start
 
 Backend listens on port `4000` by default, matching the frontend default `VITE_DRESS_RECOLOR_API_URL` fallback (`http://localhost:4000/api`).
 
-## ML service requirement
+## Hugging Face requirement
 
-This backend expects a Python ML service at `ML_SERVICE_URL` (default `http://127.0.0.1:8000`) with:
-
-- `POST /segmentation/run-once`
-- `POST /segmentation/recolor`
+This backend requires `HF_TOKEN` in environment variables. The token must include Inference Providers permission.
 

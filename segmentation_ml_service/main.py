@@ -17,7 +17,11 @@ from PIL import Image, UnidentifiedImageError
 from starlette.formparsers import MultiPartParser
 
 from services.mask_processing import build_final_garment_mask_from_segmentation
-from models.segformer_b2_clothes import run_segmentation_on_image
+from models.segformer_b2_clothes import (
+    preload_segformer_model,
+    run_segmentation_on_image,
+    warmup_segformer_model,
+)
 
 # Starlette defaults to 1024KB; segmentation_mask_b64 and images can exceed that.
 MultiPartParser.max_part_size = 64 * 1024 * 1024  # 64MB
@@ -33,6 +37,20 @@ log = logging.getLogger(__name__)
 PointList = List[Tuple[float, float]]
 
 app = FastAPI(title="Garment Recolor ML Service (SegFormer B2 Clothes)")
+
+
+@app.on_event("startup")
+async def preload_models() -> None:
+    """Load and warm up heavy model dependencies before first API request."""
+    t0 = time.perf_counter()
+    log.info("Startup preload: loading SegFormer model...")
+    try:
+        preload_segformer_model()
+        warmup_segformer_model()
+    except Exception:
+        log.exception("Startup preload failed")
+        raise
+    log.info("Startup preload complete in %.1f s", time.perf_counter() - t0)
 
 app.add_middleware(
     CORSMiddleware,

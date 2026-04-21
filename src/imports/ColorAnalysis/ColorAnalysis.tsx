@@ -1,11 +1,12 @@
 import svgPaths from "./svg-6yqrwznnmc";
 import { imgGroup, imgGroup1, imgGroup2 } from "./svg-ujm6c";
 import { SeasonSelectorPanel } from "../../app/components/SeasonSelectorPanel";
-import { NecklineTesting } from "../../app/components/NecklineTesting";
-import { TryOnPreviewCard } from "../../app/components/TryOnPreviewCard";
 import { garmentStyles } from "../../app/config/garmentStyles";
 import type { FabricOption } from "../../app/types/fabric";
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
+
+const TryOnPreviewCard = lazy(() => import("../../app/components/TryOnPreviewCard").then((module) => ({ default: module.TryOnPreviewCard })));
+const LazyNecklineTesting = lazy(() => import("../../app/components/NecklineTesting").then((module) => ({ default: module.NecklineTesting })));
 
 const PALETTE_COLORS = [
   "#fffffa", "#fffff0", "#f0eada", "#e3dac9", "#c7bba4", "#d7d2cb", "#cac1b4", "#c0b5aa",
@@ -101,9 +102,6 @@ const FABRIC_OPTIONS: FabricOption[] = [
     },
   },
 ];
-
-const DEFAULT_FABRIC_ID = "fabric060";
-const DEFAULT_FABRIC = FABRIC_OPTIONS.find((fabric) => fabric.id === DEFAULT_FABRIC_ID) ?? FABRIC_OPTIONS[0];
 
 function loadRecommendedShadesFromStorage() {
   if (typeof window === "undefined") {
@@ -390,30 +388,92 @@ function Container9() {
 function Container8({
   selectedGarmentId,
   selectedColor,
+  onColorSelect,
   selectedFabricTexture,
   isSelectedColorRecommended,
   onToggleSelectedColorRecommendation,
   dressRecoloringMode,
   onDressRecoloringModeChange,
+  onFabricOverlayAppliedChange,
+  onUploadedImageChange,
 }: {
   selectedGarmentId: string;
   selectedColor: string;
+  onColorSelect: (color: string) => void;
   selectedFabricTexture?: FabricOption;
   isSelectedColorRecommended: boolean;
   onToggleSelectedColorRecommendation: () => void;
   dressRecoloringMode: boolean;
   onDressRecoloringModeChange: (next: boolean) => void;
+  onFabricOverlayAppliedChange: (applied: boolean) => void;
+  onUploadedImageChange: (imageSrc: string | null) => void;
 }) {
+  const [mountTryOnCard, setMountTryOnCard] = useState(false);
+
+  useEffect(() => {
+    let canceled = false;
+    let timeoutId: number | undefined;
+    let idleId: number | undefined;
+
+    const triggerMount = () => {
+      if (canceled) {
+        return;
+      }
+      // Kick off 3D-heavy bundle fetch only after first paint/idle.
+      void import("../../app/components/TryOnPreviewCard").finally(() => {
+        if (!canceled) {
+          setMountTryOnCard(true);
+        }
+      });
+    };
+
+    const idleApi = window as Window & {
+      requestIdleCallback?: (callback: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+
+    if (typeof idleApi.requestIdleCallback === "function") {
+      idleId = idleApi.requestIdleCallback(triggerMount, { timeout: 600 });
+    } else {
+      timeoutId = window.setTimeout(triggerMount, 120);
+    }
+
+    return () => {
+      canceled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+      if (idleId != null && typeof idleApi.cancelIdleCallback === "function") {
+        idleApi.cancelIdleCallback(idleId);
+      }
+    };
+  }, []);
+
+  if (!mountTryOnCard) {
+    return (
+      <div className="absolute left-0 top-0 h-[561.157px] w-[596.229px] rounded-[24px] bg-[#f8f8fb]" />
+    );
+  }
+
   return (
-    <TryOnPreviewCard
-      selectedGarmentId={selectedGarmentId}
-      garmentColor={selectedColor}
-      selectedFabric={selectedFabricTexture}
-      isColorLiked={isSelectedColorRecommended}
-      onToggleColorLike={onToggleSelectedColorRecommendation}
-      dressRecoloringMode={dressRecoloringMode}
-      onDressRecoloringModeChange={onDressRecoloringModeChange}
-    />
+    <Suspense
+      fallback={
+        <div className="absolute left-0 top-0 h-[561.157px] w-[596.229px] rounded-[24px] bg-[#f8f8fb]" />
+      }
+    >
+      <TryOnPreviewCard
+        selectedGarmentId={selectedGarmentId}
+        garmentColor={selectedColor}
+        onGarmentColorChange={onColorSelect}
+        selectedFabric={selectedFabricTexture}
+        isColorLiked={isSelectedColorRecommended}
+        onToggleColorLike={onToggleSelectedColorRecommendation}
+        dressRecoloringMode={dressRecoloringMode}
+        onDressRecoloringModeChange={onDressRecoloringModeChange}
+        onFabricOverlayAppliedChange={onFabricOverlayAppliedChange}
+        onUploadedImageChange={onUploadedImageChange}
+      />
+    </Suspense>
   );
 }
 
@@ -900,7 +960,7 @@ function Container14({
 }) {
   return (
     <div
-      className="absolute border border-[rgba(226,219,239,0.82)] border-solid h-[206px] left-[371px] rounded-[22px] top-[892px] w-[585px] bg-[rgba(255,255,255,0.9)] shadow-[0_10px_22px_-18px_rgba(49,34,84,0.45)]"
+      className="absolute border border-[rgba(226,219,239,0.82)] border-solid h-[206px] left-[371px] rounded-[22px] top-[902px] w-[585px] bg-[rgba(255,255,255,0.9)] shadow-[0_10px_22px_-18px_rgba(49,34,84,0.45)]"
       data-name="Container"
     >
       <Container15 />
@@ -916,23 +976,143 @@ function Container({
   selectedGarmentId,
   onGarmentSelect,
   selectedColor,
+  onColorSelect,
   selectedFabricTexture,
   onFabricSelect,
   isSelectedColorRecommended,
   onToggleSelectedColorRecommendation,
   dressRecoloringMode,
   onDressRecoloringModeChange,
+  isFabricWorkflowApplied,
+  onFabricOverlayAppliedChange,
+  onUploadedImageChange,
 }: {
   selectedGarmentId: string;
   onGarmentSelect: (garmentId: string) => void;
   selectedColor: string;
+  onColorSelect: (color: string) => void;
   selectedFabricTexture?: FabricOption;
   onFabricSelect: (fabric: FabricOption) => void;
   isSelectedColorRecommended: boolean;
   onToggleSelectedColorRecommendation: () => void;
   dressRecoloringMode: boolean;
   onDressRecoloringModeChange: (next: boolean) => void;
+  isFabricWorkflowApplied: boolean;
+  onFabricOverlayAppliedChange: (applied: boolean) => void;
+  onUploadedImageChange: (imageSrc: string | null) => void;
 }) {
+  const isNecklineDisabled = dressRecoloringMode;
+  const [heavyPanelsReady, setHeavyPanelsReady] = useState(false);
+  const [necklinePanelReady, setNecklinePanelReady] = useState(false);
+
+  useEffect(() => {
+    if (heavyPanelsReady || typeof window === "undefined") {
+      return;
+    }
+
+    const win = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+
+    let idleId: number | null = null;
+    let timeoutId: number | null = null;
+
+    const enableHeavyPanels = () => {
+      setHeavyPanelsReady(true);
+      win.removeEventListener("pointerdown", enableHeavyPanels);
+      win.removeEventListener("keydown", enableHeavyPanels);
+      win.removeEventListener("touchstart", enableHeavyPanels);
+      if (idleId !== null && typeof win.cancelIdleCallback === "function") {
+        win.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+    };
+
+    if (typeof win.requestIdleCallback === "function") {
+      idleId = win.requestIdleCallback(enableHeavyPanels, { timeout: 1200 });
+    } else {
+      timeoutId = globalThis.setTimeout(enableHeavyPanels, 160);
+    }
+
+    win.addEventListener("pointerdown", enableHeavyPanels, { passive: true, once: true });
+    win.addEventListener("keydown", enableHeavyPanels, { once: true });
+    win.addEventListener("touchstart", enableHeavyPanels, { passive: true, once: true });
+
+    return () => {
+      win.removeEventListener("pointerdown", enableHeavyPanels);
+      win.removeEventListener("keydown", enableHeavyPanels);
+      win.removeEventListener("touchstart", enableHeavyPanels);
+      if (idleId !== null && typeof win.cancelIdleCallback === "function") {
+        win.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+    };
+  }, [heavyPanelsReady]);
+
+  useEffect(() => {
+    if (!heavyPanelsReady || necklinePanelReady || typeof window === "undefined") {
+      return;
+    }
+
+    const win = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+
+    let idleId: number | null = null;
+    let timeoutId: number | null = null;
+    let canceled = false;
+
+    const loadNecklinePanel = () => {
+      if (canceled) {
+        return;
+      }
+      // Keep first interaction focused on try-on/color controls; load neckline next.
+      void import("../../app/components/NecklineTesting").finally(() => {
+        if (!canceled) {
+          setNecklinePanelReady(true);
+        }
+      });
+      win.removeEventListener("pointerdown", loadNecklinePanel);
+      win.removeEventListener("keydown", loadNecklinePanel);
+      win.removeEventListener("touchstart", loadNecklinePanel);
+      if (idleId !== null && typeof win.cancelIdleCallback === "function") {
+        win.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+    };
+
+    if (typeof win.requestIdleCallback === "function") {
+      idleId = win.requestIdleCallback(loadNecklinePanel, { timeout: 1600 });
+    } else {
+      timeoutId = globalThis.setTimeout(loadNecklinePanel, 650);
+    }
+
+    win.addEventListener("pointerdown", loadNecklinePanel, { passive: true, once: true });
+    win.addEventListener("keydown", loadNecklinePanel, { once: true });
+    win.addEventListener("touchstart", loadNecklinePanel, { passive: true, once: true });
+
+    return () => {
+      canceled = true;
+      win.removeEventListener("pointerdown", loadNecklinePanel);
+      win.removeEventListener("keydown", loadNecklinePanel);
+      win.removeEventListener("touchstart", loadNecklinePanel);
+      if (idleId !== null && typeof win.cancelIdleCallback === "function") {
+        win.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+    };
+  }, [heavyPanelsReady, necklinePanelReady]);
+
   return (
     <div
       className="absolute h-[1195px] left-[32px] top-[129px] w-[970px]"
@@ -940,20 +1120,38 @@ function Container({
     >
       <Container1 />
       <Container7 />
-      <Container8
-        selectedGarmentId={selectedGarmentId}
-        selectedColor={selectedColor}
-        selectedFabricTexture={selectedFabricTexture}
-        isSelectedColorRecommended={isSelectedColorRecommended}
-        onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
-        dressRecoloringMode={dressRecoloringMode}
-        onDressRecoloringModeChange={onDressRecoloringModeChange}
-      />
-      <NecklineTesting
-        selectedGarmentId={selectedGarmentId}
-        onGarmentSelect={onGarmentSelect}
-        garmentColor={selectedColor}
-      />
+      {heavyPanelsReady ? (
+        <Container8
+          selectedGarmentId={selectedGarmentId}
+          selectedColor={selectedColor}
+          onColorSelect={onColorSelect}
+          selectedFabricTexture={selectedFabricTexture}
+          isSelectedColorRecommended={isSelectedColorRecommended}
+          onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
+          dressRecoloringMode={dressRecoloringMode}
+          onDressRecoloringModeChange={onDressRecoloringModeChange}
+          onFabricOverlayAppliedChange={onFabricOverlayAppliedChange}
+          onUploadedImageChange={onUploadedImageChange}
+        />
+      ) : (
+        <div className="absolute left-0 top-0 h-[561.157px] w-[596.229px] rounded-[24px] bg-[#f8f8fb]" />
+      )}
+      {necklinePanelReady ? (
+        <Suspense
+          fallback={
+            <div className="absolute left-[370px] top-[688px] h-[188px] w-[585px] rounded-[22px] border border-[rgba(226,219,239,0.82)] bg-[rgba(255,255,255,0.9)]" />
+          }
+        >
+          <LazyNecklineTesting
+            selectedGarmentId={selectedGarmentId}
+            onGarmentSelect={onGarmentSelect}
+            garmentColor={selectedColor}
+            disabled={isNecklineDisabled}
+          />
+        </Suspense>
+      ) : (
+        <div className="absolute left-[370px] top-[688px] h-[188px] w-[585px] rounded-[22px] border border-[rgba(226,219,239,0.82)] bg-[rgba(255,255,255,0.9)]" />
+      )}
       <Container14
         selectedFabricTexture={selectedFabricTexture}
         onFabricSelect={onFabricSelect}
@@ -2718,6 +2916,10 @@ function Ty({
   onClearRecommendedShades,
   dressRecoloringMode,
   onDressRecoloringModeChange,
+  isFabricWorkflowApplied,
+  onFabricOverlayAppliedChange,
+  seasonPanelImageSrc,
+  onUploadedImageChange,
 }: {
   mainSeason: string;
   selectedGarmentId: string;
@@ -2732,6 +2934,10 @@ function Ty({
   onClearRecommendedShades: () => void;
   dressRecoloringMode: boolean;
   onDressRecoloringModeChange: (next: boolean) => void;
+  isFabricWorkflowApplied: boolean;
+  onFabricOverlayAppliedChange: (applied: boolean) => void;
+  seasonPanelImageSrc: string | null;
+  onUploadedImageChange: (imageSrc: string | null) => void;
 }) {
   return (
     <div
@@ -2742,14 +2948,18 @@ function Ty({
         selectedGarmentId={selectedGarmentId}
         onGarmentSelect={onGarmentSelect}
         selectedColor={selectedColor}
+        onColorSelect={onColorSelect}
         selectedFabricTexture={selectedFabricTexture}
         onFabricSelect={onFabricSelect}
         isSelectedColorRecommended={isSelectedColorRecommended}
         onToggleSelectedColorRecommendation={onToggleSelectedColorRecommendation}
         dressRecoloringMode={dressRecoloringMode}
         onDressRecoloringModeChange={onDressRecoloringModeChange}
+        isFabricWorkflowApplied={isFabricWorkflowApplied}
+        onFabricOverlayAppliedChange={onFabricOverlayAppliedChange}
+        onUploadedImageChange={onUploadedImageChange}
       />
-      <SeasonSelectorPanel mainSeason={mainSeason} />
+      <SeasonSelectorPanel mainSeason={mainSeason} uploadedImageSrc={seasonPanelImageSrc} />
       <Container33
         selectedColor={selectedColor}
         onColorSelect={onColorSelect}
@@ -2774,6 +2984,10 @@ function Body({
   onClearRecommendedShades,
   dressRecoloringMode,
   onDressRecoloringModeChange,
+  isFabricWorkflowApplied,
+  onFabricOverlayAppliedChange,
+  seasonPanelImageSrc,
+  onUploadedImageChange,
 }: {
   mainSeason: string;
   selectedGarmentId: string;
@@ -2788,6 +3002,10 @@ function Body({
   onClearRecommendedShades: () => void;
   dressRecoloringMode: boolean;
   onDressRecoloringModeChange: (next: boolean) => void;
+  isFabricWorkflowApplied: boolean;
+  onFabricOverlayAppliedChange: (applied: boolean) => void;
+  seasonPanelImageSrc: string | null;
+  onUploadedImageChange: (imageSrc: string | null) => void;
 }) {
   return (
     <div
@@ -2808,6 +3026,10 @@ function Body({
         onClearRecommendedShades={onClearRecommendedShades}
         dressRecoloringMode={dressRecoloringMode}
         onDressRecoloringModeChange={onDressRecoloringModeChange}
+        isFabricWorkflowApplied={isFabricWorkflowApplied}
+        onFabricOverlayAppliedChange={onFabricOverlayAppliedChange}
+        seasonPanelImageSrc={seasonPanelImageSrc}
+        onUploadedImageChange={onUploadedImageChange}
       />
     </div>
   );
@@ -3057,13 +3279,21 @@ export default function ColorAnalysis() {
   const [mainSeason, setMainSeason] = useState("Spring");
   const [selectedGarmentId, setSelectedGarmentId] = useState(garmentStyles[0]?.id ?? "");
   const [dressRecoloringMode, setDressRecoloringMode] = useState(false);
+  const [isFabricWorkflowApplied, setIsFabricWorkflowApplied] = useState(false);
   const [selectedColor, setSelectedColor] = useState("#a09998");
-  const [selectedFabricTexture, setSelectedFabricTexture] = useState<FabricOption | undefined>(DEFAULT_FABRIC);
+  const [selectedFabricTexture, setSelectedFabricTexture] = useState<FabricOption | undefined>(undefined);
   const [recommendedShades, setRecommendedShades] = useState<string[]>(loadRecommendedShadesFromStorage);
+  const [seasonPanelImageSrc, setSeasonPanelImageSrc] = useState<string | null>(null);
 
   const handleGarmentSelect = useCallback((garmentId: string) => {
     setSelectedGarmentId(garmentId);
     setDressRecoloringMode(false);
+    setIsFabricWorkflowApplied(false);
+  }, []);
+
+  const handleDressRecoloringModeChange = useCallback((next: boolean) => {
+    setDressRecoloringMode(next);
+    setIsFabricWorkflowApplied(false);
   }, []);
 
   useEffect(() => {
@@ -3118,7 +3348,11 @@ export default function ColorAnalysis() {
         recommendedShades={recommendedShades}
         onClearRecommendedShades={handleClearRecommendedShades}
         dressRecoloringMode={dressRecoloringMode}
-        onDressRecoloringModeChange={setDressRecoloringMode}
+        onDressRecoloringModeChange={handleDressRecoloringModeChange}
+        isFabricWorkflowApplied={isFabricWorkflowApplied}
+        onFabricOverlayAppliedChange={setIsFabricWorkflowApplied}
+        seasonPanelImageSrc={seasonPanelImageSrc}
+        onUploadedImageChange={setSeasonPanelImageSrc}
       />
       <Header
         mainSeason={mainSeason}

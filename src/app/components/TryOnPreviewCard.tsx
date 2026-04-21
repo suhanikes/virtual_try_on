@@ -4,7 +4,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { garmentStyles } from '../config/garmentStyles';
 import type { FabricOption } from '../types/fabric';
-import { DressRecolorWorkflow } from '../dressRecolor/DressRecolorWorkflow';
+import { lassoSegmentation, uploadImage } from '../dressRecolor/dressRecolorApi';
+import { b64ToUint8Mask, recolorGarmentOKLCH } from '../dressRecolor/oklchRecolor';
 import { ensureMeshUv2ForAoMap } from '../utils/ensureMeshUv2';
 
 type Point = {
@@ -24,14 +25,6 @@ type UploadedImage = {
   naturalWidth: number;
   naturalHeight: number;
 };
-
-type DressRecolorSource = {
-  file: File;
-  url: string;
-};
-
-/** Upload modal: optional crop first, then shoulder marks (workflow order). */
-type UserPhotoWorkflowStep = 'crop-or-skip' | 'mark-shoulders';
 
 type InternalState = {
   glbBuffer: ArrayBuffer | null;
@@ -53,15 +46,43 @@ type InternalState = {
 interface TryOnPreviewCardProps {
   selectedGarmentId: string;
   garmentColor?: string;
+  onGarmentColorChange?: (color: string) => void;
   selectedFabric?: FabricOption;
   isColorLiked?: boolean;
   onToggleColorLike?: () => void;
   dressRecoloringMode: boolean;
   onDressRecoloringModeChange: (next: boolean) => void;
+  onFabricOverlayAppliedChange?: (applied: boolean) => void;
+  onUploadedImageChange?: (imageSrc: string | null) => void;
 }
 
 const FRAME_W = 300;
 const FRAME_H = 400;
+const DEFAULT_RECOLOR_COLOR = '#00af9d';
+
+type GarmentTypeOption = {
+  value: string;
+  label: string;
+};
+
+const GARMENT_TYPE_OPTIONS: GarmentTypeOption[] = [
+  { value: 'upper-clothes', label: 'Upper Cloth / T-shirt' },
+  { value: 'dress', label: 'Dress' },
+  { value: 'coat', label: 'Coat / Jacket' },
+  { value: 'sweater', label: 'Sweater / Hoodie' },
+  { value: 'pants', label: 'Pants / Bottoms' },
+  { value: 'skirt', label: 'Skirt' },
+];
+
+function suggestGarmentType(styleId: string | undefined): string {
+  const id = (styleId ?? '').toLowerCase();
+  if (id.includes('dress')) return 'dress';
+  if (id.includes('jacket') || id.includes('coat') || id.includes('blazer')) return 'coat';
+  if (id.includes('hoodie') || id.includes('sweater') || id.includes('knit')) return 'sweater';
+  if (id.includes('pant') || id.includes('trouser') || id.includes('jean')) return 'pants';
+  if (id.includes('skirt')) return 'skirt';
+  return 'upper-clothes';
+}
 /** Internal GLB render resolution; higher = cleaner downscale onto FRAME_W×FRAME_H (reduces moiré on detailed models). */
 const GARMENT_RENDER_PX = 1200;
 const FABRIC_MESH_HINTS = [
@@ -329,6 +350,87 @@ function naturalRectToOverlayStyle(
   };
 }
 
+function autoCropPortraitShoulderFocus(img: HTMLImageElement): UploadedImage {
+  const targetAspect = FRAME_W / FRAME_H;
+  const nw = Math.max(img.naturalWidth, 1);
+  const nh = Math.max(img.naturalHeight, 1);
+
+  let cropW: number;
+  let cropH: number;
+  if (nw / nh > targetAspect) {
+    cropH = nh;
+    cropW = cropH * targetAspect;
+  } else {
+    cropW = nw;
+    cropH = cropW / targetAspect;
+  }
+
+  // Shoulder-focused portrait crop: keep aspect ratio, zoom in moderately, bias upward a bit.
+  const shoulderScale = 0.86;
+  cropW = Math.max(1, Math.round(cropW * shoulderScale));
+  cropH = Math.max(1, Math.round(cropH * shoulderScale));
+
+  const centerX = nw * 0.5;
+  const centerY = nh * 0.44;
+  const cropX = clamp(Math.round(centerX - cropW * 0.5), 0, Math.max(0, nw - cropW));
+  const cropY = clamp(Math.round(centerY - cropH * 0.5), 0, Math.max(0, nh - cropH));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = cropW;
+  canvas.height = cropH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return {
+      src: img.src,
+      naturalWidth: img.naturalWidth,
+      naturalHeight: img.naturalHeight,
+    };
+  }
+
+  ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+  return {
+    src: canvas.toDataURL('image/png'),
+    naturalWidth: cropW,
+    naturalHeight: cropH,
+  };
+}
+
+function detectAlphaBounds(canvas: HTMLCanvasElement): { x: number; y: number; width: number; height: number } | null {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return null;
+  }
+
+  const { width, height } = canvas;
+  const pixels = ctx.getImageData(0, 0, width, height).data;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y += 2) {
+    for (let x = 0; x < width; x += 2) {
+      if (pixels[(y * width + x) * 4 + 3] > 8) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1,
+  };
+}
+
 function naturalCropRectFromCorners(a: Point, b: Point, nw: number, nh: number): CropRect {
   const x0 = clamp(Math.min(a.x, b.x), 0, nw);
   const y0 = clamp(Math.min(a.y, b.y), 0, nh);
@@ -349,6 +451,73 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     reader.onerror = () => reject(new Error('Failed to read image data'));
     reader.readAsDataURL(blob);
   });
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string): File {
+  const [meta, b64] = dataUrl.split(',');
+  const mime = meta?.match(/data:(.*?);base64/)?.[1] ?? 'image/png';
+  const bin = atob(b64 ?? '');
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    arr[i] = bin.charCodeAt(i);
+  }
+  return new File([arr], fileName, { type: mime });
+}
+
+function estimateShouldersFromGarmentCanvas(canvas: HTMLCanvasElement): Point[] | null {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    return null;
+  }
+
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w < 8 || h < 8) {
+    return null;
+  }
+
+  const pixels = ctx.getImageData(0, 0, w, h).data;
+  const alphaAt = (x: number, y: number) => pixels[(y * w + x) * 4 + 3];
+
+  let minY = h;
+  let maxY = 0;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (alphaAt(x, y) > 12) {
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+
+  if (minY >= maxY) {
+    return null;
+  }
+
+  const scanY = Math.max(minY, Math.min(maxY, Math.round(minY + (maxY - minY) * 0.2)));
+  let left = -1;
+  let right = -1;
+  for (let x = 0; x < w; x++) {
+    if (alphaAt(x, scanY) > 12) {
+      left = x;
+      break;
+    }
+  }
+  for (let x = w - 1; x >= 0; x--) {
+    if (alphaAt(x, scanY) > 12) {
+      right = x;
+      break;
+    }
+  }
+
+  if (left < 0 || right < 0 || right - left < 20) {
+    return null;
+  }
+
+  return [
+    { x: left + 6, y: scanY + 2 },
+    { x: right - 6, y: scanY + 2 },
+  ];
 }
 
 function getImageDimensions(src: string): Promise<{ width: number; height: number }> {
@@ -440,6 +609,8 @@ export function TryOnPreviewCard({
   onToggleColorLike,
   dressRecoloringMode,
   onDressRecoloringModeChange,
+  onFabricOverlayAppliedChange,
+  onUploadedImageChange,
 }: TryOnPreviewCardProps) {
   const selectedStyle = useMemo(
     () => garmentStyles.find((style) => style.id === selectedGarmentId) ?? garmentStyles[0],
@@ -451,7 +622,7 @@ export function TryOnPreviewCard({
   const garmentCanvasRef = useRef<HTMLCanvasElement>(null);
   const pickCanvasRef = useRef<HTMLCanvasElement>(null);
   const markerImageRef = useRef<HTMLImageElement>(null);
-  const markerViewportRef = useRef<HTMLDivElement>(null);
+  const recolorImageRef = useRef<HTMLImageElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cropDragStartNaturalRef = useRef<Point | null>(null);
   const cropPointerDownRef = useRef(false);
@@ -476,39 +647,103 @@ export function TryOnPreviewCard({
   const garmentColorRef = useRef(garmentColor ?? '#a09998');
   const selectedFabricRef = useRef<FabricOption | undefined>(selectedFabric);
 
-  const [isMarkingGarment, setIsMarkingGarment] = useState(true);
   const [hasGarmentShoulders, setHasGarmentShoulders] = useState(false);
   const [hasUserImage, setHasUserImage] = useState(false);
 
   const [uploadedImage, setUploadedImage] = useState<UploadedImage | null>(null);
-  const [showUserMarkerModal, setShowUserMarkerModal] = useState(false);
+  const [baseUploadedImage, setBaseUploadedImage] = useState<UploadedImage | null>(null);
+  const [hasFabricOnlyCrop, setHasFabricOnlyCrop] = useState(false);
   const [userNaturalPoints, setUserNaturalPoints] = useState<Point[]>([]);
+  const [isMarkingUserShoulders, setIsMarkingUserShoulders] = useState(false);
   const [isCropMode, setIsCropMode] = useState(false);
   const [cropRectNatural, setCropRectNatural] = useState<CropRect | null>(null);
+  const [isSelectingRecolorArea, setIsSelectingRecolorArea] = useState(false);
+  const [recolorRectNatural, setRecolorRectNatural] = useState<CropRect | null>(null);
+  const [selectedGarmentType, setSelectedGarmentType] = useState<string>(() => suggestGarmentType(selectedGarmentId));
+  const [recolorMaskPreview, setRecolorMaskPreview] = useState<string | null>(null);
+  const [hasAppliedRecolorOnce, setHasAppliedRecolorOnce] = useState(false);
+  const [isRecoloring, setIsRecoloring] = useState(false);
+  const [isMoveEnabled, setIsMoveEnabled] = useState(true);
+  const [isFabricOverlayApplied, setIsFabricOverlayApplied] = useState(false);
+  const [isBackgroundRemoved, setIsBackgroundRemoved] = useState(false);
   const [isRemovingBackground, setIsRemovingBackground] = useState(false);
   const [layoutTick, setLayoutTick] = useState(0);
   const [shoulderOverlayPoints, setShoulderOverlayPoints] = useState<Point[]>([]);
-  const [userPhotoStep, setUserPhotoStep] = useState<UserPhotoWorkflowStep>('crop-or-skip');
-  const [dressRecolorSource, setDressRecolorSource] = useState<DressRecolorSource | null>(null);
+  const [canLoadDefaultModel, setCanLoadDefaultModel] = useState(false);
+  const baseCanvasRef = useRef<HTMLCanvasElement>(null);
+  const recolorCacheRef = useRef<{
+    baseData: Uint8ClampedArray;
+    mask: Uint8Array;
+    width: number;
+    height: number;
+  } | null>(null);
+  const lastAppliedRecolorHexRef = useRef<string | null>(null);
+
+  const setFabricOverlayApplied = useCallback((next: boolean) => {
+    setIsFabricOverlayApplied(next);
+    onFabricOverlayAppliedChange?.(next);
+  }, [onFabricOverlayAppliedChange]);
 
   useEffect(() => {
-    if (!dressRecoloringMode) {
-      setDressRecolorSource((prev) => {
-        if (prev?.url) {
-          URL.revokeObjectURL(prev.url);
-        }
-        return null;
-      });
+    onUploadedImageChange?.(uploadedImage?.src ?? null);
+  }, [onUploadedImageChange, uploadedImage?.src]);
+
+  useEffect(() => {
+    if (canLoadDefaultModel || typeof window === 'undefined') {
       return;
     }
-    setShowUserMarkerModal(false);
+
+    const enableModelLoading = () => {
+      setCanLoadDefaultModel(true);
+      window.removeEventListener('pointerdown', enableModelLoading);
+      window.removeEventListener('keydown', enableModelLoading);
+      window.removeEventListener('touchstart', enableModelLoading);
+    };
+
+    window.addEventListener('pointerdown', enableModelLoading, { passive: true, once: true });
+    window.addEventListener('keydown', enableModelLoading, { once: true });
+    window.addEventListener('touchstart', enableModelLoading, { passive: true, once: true });
+
+    return () => {
+      window.removeEventListener('pointerdown', enableModelLoading);
+      window.removeEventListener('keydown', enableModelLoading);
+      window.removeEventListener('touchstart', enableModelLoading);
+    };
+  }, []);
+
+  useEffect(() => {
+    setSelectedGarmentType(suggestGarmentType(selectedGarmentId));
+  }, [selectedGarmentId]);
+
+  useEffect(() => {
+    if (dressRecoloringMode && hasFabricOnlyCrop && baseUploadedImage) {
+      // Fabric crop is mode-local; AI recolor should always start from the uncropped source image.
+      setUploadedImage(baseUploadedImage);
+      setHasFabricOnlyCrop(false);
+      recolorCacheRef.current = null;
+      lastAppliedRecolorHexRef.current = null;
+      setHasAppliedRecolorOnce(false);
+      setRecolorMaskPreview(null);
+    }
+
+    setIsCropMode(false);
+    setIsSelectingRecolorArea(false);
+    setIsMarkingUserShoulders(false);
+    setUserNaturalPoints([]);
+    setHasUserImage(false);
+    setIsMoveEnabled(true);
+    setFabricOverlayApplied(false);
+
+    const personImg = personImgRef.current;
+    if (personImg) {
+      personImg.style.display = 'none';
+    }
   }, [dressRecoloringMode]);
 
   useLayoutEffect(() => {
     const img = markerImageRef.current;
     if (
-      !showUserMarkerModal ||
-      userPhotoStep !== 'mark-shoulders' ||
+      !isMarkingUserShoulders ||
       !img ||
       userNaturalPoints.length === 0 ||
       img.naturalWidth < 1
@@ -518,7 +753,7 @@ export function TryOnPreviewCard({
     }
 
     setShoulderOverlayPoints(userNaturalPoints.map((n) => naturalPointToElementLocal(n, img)));
-  }, [userNaturalPoints, layoutTick, uploadedImage?.src, showUserMarkerModal, userPhotoStep]);
+  }, [userNaturalPoints, layoutTick, uploadedImage?.src, isMarkingUserShoulders]);
 
   const cropOverlayStyle = useMemo(() => {
     const img = markerImageRef.current;
@@ -544,6 +779,30 @@ export function TryOnPreviewCard({
       'rotate(' + state.imgRotation + 'rad) ' +
       'scale(' + sc + ')';
   }, []);
+
+  const applyAnchoredZoom = useCallback((nextZoomMul: number) => {
+    const st = stateRef.current;
+    const clampedNext = clamp(nextZoomMul, 0.2, 5);
+    if (Math.abs(clampedNext - st.userZoomMul) < 1e-6) {
+      return;
+    }
+
+    // Keep image center fixed while zooming so position does not appear to shift.
+    const img = personImgRef.current;
+    const centerX = Math.max(img?.naturalWidth ?? 0, 1) * 0.5;
+    const centerY = Math.max(img?.naturalHeight ?? 0, 1) * 0.5;
+
+    const oldScale = st.imgScale * st.userZoomMul;
+    const newScale = st.imgScale * clampedNext;
+    const deltaScale = oldScale - newScale;
+    const cosT = Math.cos(st.imgRotation);
+    const sinT = Math.sin(st.imgRotation);
+
+    st.userPanX += deltaScale * (centerX * cosT - centerY * sinT);
+    st.userPanY += deltaScale * (centerX * sinT + centerY * cosT);
+    st.userZoomMul = clampedNext;
+    applyImageTransform();
+  }, [applyImageTransform]);
 
   const handleTryOnPointerDown = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) {
@@ -587,7 +846,7 @@ export function TryOnPreviewCard({
 
   useEffect(() => {
     const el = tryOnInteractRef.current;
-    if (!el || !hasUserImage || showUserMarkerModal || isMarkingGarment) {
+    if (!el || !hasUserImage || dressRecoloringMode || !isFabricOverlayApplied || !isMoveEnabled) {
       return;
     }
 
@@ -595,13 +854,12 @@ export function TryOnPreviewCard({
       ev.preventDefault();
       const st = stateRef.current;
       const next = st.userZoomMul * Math.exp(-ev.deltaY * 0.0012);
-      st.userZoomMul = clamp(next, 0.2, 5);
-      applyImageTransform();
+      applyAnchoredZoom(next);
     };
 
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [hasUserImage, showUserMarkerModal, isMarkingGarment, applyImageTransform]);
+  }, [hasUserImage, dressRecoloringMode, isFabricOverlayApplied, isMoveEnabled, applyAnchoredZoom]);
 
   /** Maps viewport click to internal try-on frame coords (FRAME_W × FRAME_H), accounting for CSS scale on ancestors. */
   const clientToFramePoint = useCallback((clientX: number, clientY: number) => {
@@ -855,14 +1113,31 @@ export function TryOnPreviewCard({
 
             ctx.clearRect(0, 0, FRAME_W, FRAME_H);
 
-            const drawW = FRAME_W * scaleMul;
-            const drawH = drawW;
-            const drawX = (FRAME_W - drawW) / 2;
-            const drawY = (FRAME_H - drawH) + shiftMul * FRAME_H;
+            const alphaBounds = detectAlphaBounds(off);
+            const srcX = alphaBounds?.x ?? 0;
+            const srcY = alphaBounds?.y ?? 0;
+            const srcW = Math.max(alphaBounds?.width ?? off.width, 1);
+            const srcH = Math.max(alphaBounds?.height ?? off.height, 1);
+
+            // Keep top 70% of garment overlay (cut 30% from bottom).
+            const keptSrcH = Math.max(1, Math.round(srcH * 0.7));
+
+            // Fill card width and align overlay base to the bottom edge of the card.
+            const dressikaLikeFillScale = 1.4;
+            const drawW = FRAME_W * Math.max(scaleMul, 1) * dressikaLikeFillScale;
+            const drawH = drawW * (keptSrcH / srcW);
+            const drawX = (FRAME_W - drawW) * 0.5;
+            const drawY = FRAME_H - drawH + shiftMul * FRAME_H;
 
             ctx.imageSmoothingEnabled = true;
             ctx.imageSmoothingQuality = 'high';
-            ctx.drawImage(off, drawX, drawY, drawW, drawH);
+            ctx.drawImage(off, srcX, srcY, srcW, keptSrcH, drawX, drawY, drawW, drawH);
+
+            const estimatedShoulders = estimateShouldersFromGarmentCanvas(garmentCanvas);
+            if (estimatedShoulders && estimatedShoulders.length === 2) {
+              stateRef.current.modelShoulders = estimatedShoulders;
+              setHasGarmentShoulders(true);
+            }
           } catch (error) {
             console.error(error);
           } finally {
@@ -918,16 +1193,23 @@ export function TryOnPreviewCard({
 
       const img = new Image();
       img.onload = () => {
-        setUploadedImage({
-          src: img.src,
-          naturalWidth: img.naturalWidth,
-          naturalHeight: img.naturalHeight,
-        });
-        setUserNaturalPoints([]);
+        const autoCropped = autoCropPortraitShoulderFocus(img);
+        recolorCacheRef.current = null;
+        lastAppliedRecolorHexRef.current = null;
+        setUploadedImage(autoCropped);
+        setBaseUploadedImage(autoCropped);
+        setHasFabricOnlyCrop(false);
+        setIsBackgroundRemoved(false);
+        setFabricOverlayApplied(false);
+        setHasUserImage(false);
+        setHasAppliedRecolorOnce(false);
+        setRecolorMaskPreview(null);
         setIsCropMode(false);
         setCropRectNatural(null);
-        setUserPhotoStep('crop-or-skip');
-        setShowUserMarkerModal(true);
+        setIsSelectingRecolorArea(false);
+        setRecolorRectNatural(null);
+        setUserNaturalPoints([]);
+        setIsMarkingUserShoulders(false);
       };
       img.src = loaded;
     };
@@ -937,7 +1219,6 @@ export function TryOnPreviewCard({
 
   useEffect(() => {
     const state = stateRef.current;
-    state.modelShoulders = [];
     state.fitScale = 100;
     state.fitShift = 0;
     state.fitOpacity = 100;
@@ -949,35 +1230,14 @@ export function TryOnPreviewCard({
     state.userPanY = 0;
     state.userZoomMul = 1;
 
-    setIsMarkingGarment(true);
-    setHasGarmentShoulders(false);
-    setHasUserImage(false);
-    setUploadedImage(null);
-    setShowUserMarkerModal(false);
-    setUserNaturalPoints([]);
-    setIsCropMode(false);
-    setCropRectNatural(null);
-    setUserPhotoStep('crop-or-skip');
-
-    const personImg = personImgRef.current;
-    if (personImg) {
-      personImg.style.display = 'none';
-      personImg.style.clipPath = 'none';
-      personImg.removeAttribute('src');
-    }
-
-    drawPickOverlay([], false);
-
-    if (dressRecoloringMode) {
+    const modelUrl = selectedStyle?.modelUrl;
+    if (!modelUrl) {
       state.glbBuffer = null;
-      setIsMarkingGarment(false);
-      setHasGarmentShoulders(false);
       renderGarment();
       return;
     }
 
-    const modelUrl = selectedStyle?.modelUrl;
-    if (!modelUrl) {
+    if (!canLoadDefaultModel) {
       state.glbBuffer = null;
       renderGarment();
       return;
@@ -1013,7 +1273,7 @@ export function TryOnPreviewCard({
     return () => {
       canceled = true;
     };
-  }, [drawPickOverlay, renderGarment, dressRecoloringMode, selectedStyle?.modelUrl]);
+  }, [renderGarment, selectedStyle?.modelUrl, canLoadDefaultModel]);
 
   useEffect(() => {
     garmentColorRef.current = garmentColor ?? '#a09998';
@@ -1023,32 +1283,6 @@ export function TryOnPreviewCard({
       renderGarment();
     }
   }, [garmentColor, renderGarment, selectedFabric]);
-
-  const handleFrameClick = (event: MouseEvent<HTMLDivElement>) => {
-    if (!isMarkingGarment) {
-      return;
-    }
-
-    const state = stateRef.current;
-    if (!state.glbBuffer) {
-      return;
-    }
-
-    const p = clientToFramePoint(event.clientX, event.clientY);
-
-    if (state.modelShoulders.length >= 2) {
-      state.modelShoulders.length = 0;
-    }
-
-    state.modelShoulders.push({ x: p.x, y: p.y });
-    drawPickOverlay(state.modelShoulders, true);
-
-    if (state.modelShoulders.length === 2) {
-      setIsMarkingGarment(false);
-      setHasGarmentShoulders(true);
-      drawPickOverlay([], false);
-    }
-  };
 
   const handleFrameDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -1060,20 +1294,7 @@ export function TryOnPreviewCard({
 
     const file = files[0];
     if (file.type.startsWith('image/')) {
-      if (dressRecoloringMode) {
-        setDressRecolorSource((prev) => {
-          if (prev?.url) {
-            URL.revokeObjectURL(prev.url);
-          }
-          return { file, url: URL.createObjectURL(file) };
-        });
-        return;
-      }
       loadPhoto(file);
-      return;
-    }
-
-    if (dressRecoloringMode) {
       return;
     }
 
@@ -1088,49 +1309,16 @@ export function TryOnPreviewCard({
       return;
     }
 
-    if (dressRecoloringMode) {
-      setDressRecolorSource((prev) => {
-        if (prev?.url) {
-          URL.revokeObjectURL(prev.url);
-        }
-        return { file, url: URL.createObjectURL(file) };
-      });
-      event.target.value = '';
-      return;
-    }
-
     loadPhoto(file);
     event.target.value = '';
-  };
-
-  const handleMarkGarment = () => {
-    if (!stateRef.current.glbBuffer) {
-      return;
-    }
-
-    const st = stateRef.current;
-    st.userPanX = 0;
-    st.userPanY = 0;
-    st.userZoomMul = 1;
-    st.modelShoulders = [];
-    setIsMarkingGarment(true);
-    setHasGarmentShoulders(false);
-    drawPickOverlay([], true);
-
-    const personImg = personImgRef.current;
-    if (personImg) {
-      personImg.style.display = 'none';
-      personImg.style.clipPath = 'none';
-    }
-    setHasUserImage(false);
   };
 
   const handleUserMarkerClick = (event: MouseEvent<HTMLImageElement>) => {
     if (
       isCropMode ||
-      userPhotoStep !== 'mark-shoulders' ||
       !markerImageRef.current ||
-      !uploadedImage
+      !uploadedImage ||
+      !isMarkingUserShoulders
     ) {
       return;
     }
@@ -1140,37 +1328,47 @@ export function TryOnPreviewCard({
   };
 
   const handleCropPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!isCropMode || !markerImageRef.current) {
+    const imageRef = dressRecoloringMode ? recolorImageRef.current : markerImageRef.current;
+    const isSelecting = dressRecoloringMode ? isSelectingRecolorArea : isCropMode;
+
+    if (!isSelecting || !imageRef) {
       return;
     }
 
     event.preventDefault();
-    const img = markerImageRef.current;
-    const start = clientToNaturalPoint(event.clientX, event.clientY, img);
+    const start = clientToNaturalPoint(event.clientX, event.clientY, imageRef);
     cropDragStartNaturalRef.current = start;
     cropPointerDownRef.current = true;
-    setCropRectNatural({ x: start.x, y: start.y, width: 0, height: 0 });
+    const nextRect = { x: start.x, y: start.y, width: 0, height: 0 };
+    if (dressRecoloringMode) {
+      setRecolorRectNatural(nextRect);
+    } else {
+      setCropRectNatural(nextRect);
+    }
   };
 
   useEffect(() => {
-    if (!isCropMode) {
+    if (!isCropMode && !isSelectingRecolorArea) {
       cropPointerDownRef.current = false;
       cropDragStartNaturalRef.current = null;
       return;
     }
 
     const onMove = (e: PointerEvent) => {
-      if (!cropPointerDownRef.current || !cropDragStartNaturalRef.current || !markerImageRef.current) {
+      const img = dressRecoloringMode ? recolorImageRef.current : markerImageRef.current;
+      if (!cropPointerDownRef.current || !cropDragStartNaturalRef.current || !img) {
         return;
       }
 
-      const img = markerImageRef.current;
       const cur = clientToNaturalPoint(e.clientX, e.clientY, img);
-      // Must match the displayed <img> intrinsic size (same as clientToNaturalPoint), not React state —
-      // stale uploadedImage.natural* breaks overlay vs canvas crop alignment.
       const nw = Math.max(img.naturalWidth, 1);
       const nh = Math.max(img.naturalHeight, 1);
-      setCropRectNatural(naturalCropRectFromCorners(cropDragStartNaturalRef.current, cur, nw, nh));
+      const nextRect = naturalCropRectFromCorners(cropDragStartNaturalRef.current, cur, nw, nh);
+      if (dressRecoloringMode) {
+        setRecolorRectNatural(nextRect);
+      } else {
+        setCropRectNatural(nextRect);
+      }
     };
 
     const endDrag = () => {
@@ -1186,24 +1384,7 @@ export function TryOnPreviewCard({
       window.removeEventListener('pointerup', endDrag);
       window.removeEventListener('pointercancel', endDrag);
     };
-  }, [isCropMode]);
-
-  useEffect(() => {
-    if (!showUserMarkerModal) {
-      return;
-    }
-
-    const el = markerViewportRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') {
-      return;
-    }
-
-    const ro = new ResizeObserver(() => {
-      setLayoutTick((t) => t + 1);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [showUserMarkerModal]);
+  }, [isCropMode, isSelectingRecolorArea, dressRecoloringMode]);
 
   const applyCropSelection = async () => {
     if (!uploadedImage || !cropRectNatural || !markerImageRef.current) {
@@ -1249,26 +1430,20 @@ export function TryOnPreviewCard({
 
     const croppedSource = canvas.toDataURL('image/png');
 
+    recolorCacheRef.current = null;
+    lastAppliedRecolorHexRef.current = null;
     setUploadedImage({
       src: croppedSource,
       naturalWidth: cropWidth,
       naturalHeight: cropHeight,
     });
+    setHasFabricOnlyCrop(true);
     setUserNaturalPoints([]);
+    setIsMarkingUserShoulders(false);
+    setHasUserImage(false);
+    setFabricOverlayApplied(false);
     setIsCropMode(false);
     setCropRectNatural(null);
-    setUserPhotoStep('mark-shoulders');
-  };
-
-  const skipCropUseFullImage = () => {
-    if (!uploadedImage) {
-      return;
-    }
-
-    setIsCropMode(false);
-    setCropRectNatural(null);
-    setUserNaturalPoints([]);
-    setUserPhotoStep('mark-shoulders');
   };
 
   const handleCropButtonClick = () => {
@@ -1280,6 +1455,7 @@ export function TryOnPreviewCard({
       setIsCropMode(true);
       setCropRectNatural(null);
       setUserNaturalPoints([]);
+      setIsMarkingUserShoulders(false);
       return;
     }
 
@@ -1340,19 +1516,30 @@ export function TryOnPreviewCard({
         const { width, height } = await getImageDimensions(objectUrl);
         const outputDataUrl = await blobToDataUrl(outputBlob);
 
+        recolorCacheRef.current = null;
+        lastAppliedRecolorHexRef.current = null;
         setUploadedImage({
           src: outputDataUrl,
           naturalWidth: width,
           naturalHeight: height,
         });
+        setBaseUploadedImage({
+          src: outputDataUrl,
+          naturalWidth: width,
+          naturalHeight: height,
+        });
+        setHasFabricOnlyCrop(false);
+        setIsBackgroundRemoved(true);
       } finally {
         URL.revokeObjectURL(objectUrl);
       }
 
       setUserNaturalPoints([]);
+      setIsMarkingUserShoulders(false);
+      setHasUserImage(false);
+      setFabricOverlayApplied(false);
       setIsCropMode(false);
       setCropRectNatural(null);
-      setUserPhotoStep('crop-or-skip');
     } catch (error) {
       const isAbortError = error instanceof DOMException && error.name === 'AbortError';
       const detail = isAbortError
@@ -1373,10 +1560,6 @@ export function TryOnPreviewCard({
   const applyGarmentAlignment = () => {
     const state = stateRef.current;
     if (!uploadedImage || state.modelShoulders.length !== 2 || userNaturalPoints.length !== 2) {
-      return;
-    }
-
-    if (userPhotoStep !== 'mark-shoulders') {
       return;
     }
 
@@ -1421,226 +1604,428 @@ export function TryOnPreviewCard({
       personImg.style.clipPath = 'none';
       applyImageTransform();
 
-      setShowUserMarkerModal(false);
+      setIsMarkingUserShoulders(false);
       setHasUserImage(true);
+      setFabricOverlayApplied(true);
     });
   };
 
+  const handleApplyRecolor = async () => {
+    if (!uploadedImage || isRecoloring) {
+      return;
+    }
+
+    const selectedRect = recolorRectNatural ?? {
+      x: 0,
+      y: 0,
+      width: uploadedImage.naturalWidth,
+      height: uploadedImage.naturalHeight,
+    };
+    setIsSelectingRecolorArea(false);
+    setRecolorRectNatural(null);
+
+    const sourceFile = dataUrlToFile(uploadedImage.src, 'recolor-source.png');
+    const targetHex = (garmentColor ?? DEFAULT_RECOLOR_COLOR).toLowerCase();
+    const nw = Math.max(uploadedImage.naturalWidth, 1);
+    const nh = Math.max(uploadedImage.naturalHeight, 1);
+    const x0 = clamp(Math.round(selectedRect.x), 0, nw - 1);
+    const y0 = clamp(Math.round(selectedRect.y), 0, nh - 1);
+    const x1 = clamp(Math.round(selectedRect.x + selectedRect.width), x0 + 1, nw);
+    const y1 = clamp(Math.round(selectedRect.y + selectedRect.height), y0 + 1, nh);
+
+    setIsRecoloring(true);
+
+    try {
+      const uploadData = await uploadImage(sourceFile);
+      const lassoPoints = [
+        { x: x0, y: y0 },
+        { x: x1, y: y0 },
+        { x: x1, y: y1 },
+        { x: x0, y: y1 },
+      ];
+
+      const seg = await lassoSegmentation({
+        imageId: uploadData.imageId,
+        lassoPoints,
+        selectedColor: targetHex,
+        garmentType: selectedGarmentType,
+      });
+
+      if (seg.mask_preview) {
+        setRecolorMaskPreview(seg.mask_preview);
+      }
+
+      if (!seg.garment_mask_b64 || !seg.width || !seg.height) {
+        return;
+      }
+
+      const canvas = baseCanvasRef.current;
+      if (!canvas) {
+        return;
+      }
+
+      canvas.width = seg.width;
+      canvas.height = seg.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+
+      const img = new Image();
+      img.src = uploadedImage.src;
+      await img.decode();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const baseImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const mask = b64ToUint8Mask(seg.garment_mask_b64);
+      recolorCacheRef.current = {
+        baseData: new Uint8ClampedArray(baseImage.data),
+        mask: new Uint8Array(mask),
+        width: baseImage.width,
+        height: baseImage.height,
+      };
+
+      const recolorResult = recolorGarmentOKLCH(
+        baseImage.data,
+        baseImage.width,
+        baseImage.height,
+        mask,
+        targetHex,
+      );
+
+      const imageDataBuffer = new Uint8ClampedArray(recolorResult.data.length);
+      imageDataBuffer.set(recolorResult.data);
+      const out = new ImageData(imageDataBuffer, recolorResult.width, recolorResult.height);
+      ctx.putImageData(out, 0, 0);
+      const resultUrl = canvas.toDataURL('image/png');
+
+      setUploadedImage({
+        src: resultUrl,
+        naturalWidth: recolorResult.width,
+        naturalHeight: recolorResult.height,
+      });
+      setBaseUploadedImage({
+        src: resultUrl,
+        naturalWidth: recolorResult.width,
+        naturalHeight: recolorResult.height,
+      });
+      setHasFabricOnlyCrop(false);
+      setHasAppliedRecolorOnce(true);
+      lastAppliedRecolorHexRef.current = targetHex;
+    } catch (error) {
+      console.error('Recolor apply failed:', error);
+    } finally {
+      setIsRecoloring(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!dressRecoloringMode || !hasAppliedRecolorOnce || !garmentColor || isRecoloring) {
+      return;
+    }
+
+    const cache = recolorCacheRef.current;
+    if (!cache) {
+      return;
+    }
+
+    const targetHex = garmentColor.toLowerCase();
+    if (lastAppliedRecolorHexRef.current === targetHex) {
+      return;
+    }
+
+    const canvas = baseCanvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    setIsRecoloring(true);
+    try {
+      canvas.width = cache.width;
+      canvas.height = cache.height;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+
+      const recolorResult = recolorGarmentOKLCH(
+        new Uint8ClampedArray(cache.baseData),
+        cache.width,
+        cache.height,
+        cache.mask,
+        targetHex,
+      );
+
+      const imageDataBuffer = new Uint8ClampedArray(recolorResult.data.length);
+      imageDataBuffer.set(recolorResult.data);
+      const out = new ImageData(imageDataBuffer, recolorResult.width, recolorResult.height);
+      ctx.putImageData(out, 0, 0);
+      const resultUrl = canvas.toDataURL('image/png');
+
+      setUploadedImage({
+        src: resultUrl,
+        naturalWidth: recolorResult.width,
+        naturalHeight: recolorResult.height,
+      });
+      setBaseUploadedImage({
+        src: resultUrl,
+        naturalWidth: recolorResult.width,
+        naturalHeight: recolorResult.height,
+      });
+      setHasFabricOnlyCrop(false);
+      lastAppliedRecolorHexRef.current = targetHex;
+    } finally {
+      setIsRecoloring(false);
+    }
+  }, [dressRecoloringMode, garmentColor, hasAppliedRecolorOnce, isRecoloring]);
+
+  const zoomUserImage = (direction: 1 | -1) => {
+    const st = stateRef.current;
+    const next = st.userZoomMul * (direction > 0 ? 1.08 : 1 / 1.08);
+    applyAnchoredZoom(next);
+  };
+
+  const resetToInitialUploadState = useCallback(() => {
+    recolorCacheRef.current = null;
+    lastAppliedRecolorHexRef.current = null;
+
+    setUploadedImage(null);
+    setBaseUploadedImage(null);
+    setHasFabricOnlyCrop(false);
+    setHasUserImage(false);
+    setUserNaturalPoints([]);
+    setIsMarkingUserShoulders(false);
+    setIsCropMode(false);
+    setCropRectNatural(null);
+    setIsSelectingRecolorArea(false);
+    setRecolorRectNatural(null);
+    setRecolorMaskPreview(null);
+    setHasAppliedRecolorOnce(false);
+    setIsBackgroundRemoved(false);
+    setIsMoveEnabled(true);
+    setFabricOverlayApplied(false);
+
+    const personImg = personImgRef.current;
+    if (personImg) {
+      personImg.src = '';
+      personImg.style.display = 'none';
+      personImg.style.transform = '';
+    }
+  }, [setFabricOverlayApplied]);
+
   return (
     <div className="absolute left-[452px] top-0 w-[420px]" data-name="Container">
+      <div className="mb-3 flex items-center justify-center rounded-[8px] border border-[#0e3d56] bg-white p-[2px] shadow-sm">
+        <button
+          type="button"
+          onClick={() => onDressRecoloringModeChange(true)}
+          className={`min-w-[136px] rounded-[6px] px-3 py-1.5 text-[11px] font-semibold ${
+            dressRecoloringMode ? 'bg-[#041b2a] text-white' : 'bg-white text-[#2f3e4a]'
+          }`}
+        >
+          AI Outfit Recoloring
+        </button>
+        <button
+          type="button"
+          onClick={() => onDressRecoloringModeChange(false)}
+          className={`min-w-[122px] rounded-[6px] px-3 py-1.5 text-[11px] font-semibold ${
+            !dressRecoloringMode ? 'bg-[#041b2a] text-white' : 'bg-white text-[#2f3e4a]'
+          }`}
+        >
+          Fabric Overlay
+        </button>
+      </div>
+
       <div className="viewer-wrap">
         <div
           id="tryon-frame"
           ref={frameRef}
           className="frame"
+          onClick={() => {
+            if (!uploadedImage) {
+              fileInputRef.current?.click();
+            }
+          }}
           onDragOver={(event) => event.preventDefault()}
           onDrop={handleFrameDrop}
         >
-          {dressRecoloringMode ? (
-            <DressRecolorWorkflow
-              active={dressRecoloringMode}
-              sourceFile={dressRecolorSource?.file ?? null}
-              sourceObjectUrl={dressRecolorSource?.url ?? null}
-              garmentColor={garmentColor ?? '#a09998'}
+          {uploadedImage && dressRecoloringMode && (
+            <img
+              ref={recolorImageRef}
+              src={uploadedImage.src}
+              alt="Recolor source"
+              className="absolute inset-0 z-[1] h-full w-full object-contain"
+              onLoad={() => setLayoutTick((t) => t + 1)}
+              draggable={false}
             />
-          ) : (
-            <>
-              <img
-                id="person-img"
-                ref={personImgRef}
-                alt="Your try-on photo"
-                onLoad={() => {
-                  const el = personImgRef.current;
-                  if (!el || el.naturalWidth < 1) {
-                    return;
-                  }
-                  el.style.width = `${el.naturalWidth}px`;
-                  el.style.height = `${el.naturalHeight}px`;
-                  applyImageTransform();
-                }}
-              />
-              <canvas id="garment-canvas" ref={garmentCanvasRef} width={FRAME_W} height={FRAME_H} />
-              <canvas id="pick-canvas" ref={pickCanvasRef} width={FRAME_W} height={FRAME_H} />
-
-              {hasUserImage && !showUserMarkerModal && !isMarkingGarment && (
-                <div
-                  ref={tryOnInteractRef}
-                  className="tryon-user-adjust-layer absolute inset-0 z-[4]"
-                  onPointerDown={handleTryOnPointerDown}
-                  onPointerMove={handleTryOnPointerMove}
-                  onPointerUp={handleTryOnPointerUp}
-                  onPointerCancel={handleTryOnPointerUp}
-                  aria-hidden
-                />
-              )}
-
-              {isMarkingGarment && (
-                <div className="absolute inset-0 z-[6] cursor-crosshair" onClick={handleFrameClick} />
-              )}
-
-              {onToggleColorLike && (
-                <button
-                  type="button"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onToggleColorLike();
-                  }}
-                  className="tryon-like-btn"
-                  data-liked={isColorLiked ? 'true' : 'false'}
-                  aria-label={isColorLiked ? 'Remove selected shade from recommended shades' : 'Add selected shade to recommended shades'}
-                  title={isColorLiked ? 'Saved to recommended shades' : 'Save selected shade'}
-                >
-                  <svg
-                    width="22"
-                    height="22"
-                    viewBox="0 -2 32 32"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                    aria-hidden="true"
-                  >
-                    <g transform="translate(-3)">
-                      <path
-                        d="M26,4c2.757,0,5,2.692,5,6,0,6.308-7.637,11.425-12,13.6C14.632,21.422,7,16.307,7,10c0-3.308,2.243-6,5-6a5.033,5.033,0,0,1,3.765,2.353l1.618,1.772a2,2,0,0,0,3.234,0l1.618-1.772A5.033,5.033,0,0,1,26,4m0-4a8.961,8.961,0,0,0-7,4,8.961,8.961,0,0,0-7-4C7.029,0,3,4.477,3,10,3,21.438,19,28,19,28s16-6.562,16-18c0-5.523-4.029-10-9-10Z"
-                        fill={isColorLiked ? '#dc2626' : 'none'}
-                        stroke={isColorLiked ? 'none' : '#0a0a0a'}
-                        strokeWidth={isColorLiked ? 0 : 1.15}
-                        strokeLinejoin="round"
-                      />
-                    </g>
-                  </svg>
-                </button>
-              )}
-            </>
           )}
 
-          {showUserMarkerModal && uploadedImage && (
-            <div className="absolute inset-0 z-50 flex items-center justify-center bg-[rgba(17,16,25,0.55)] p-4">
-              <div className="flex w-full max-w-[400px] flex-col gap-4 rounded-[20px] border border-[rgba(158,106,255,0.22)] bg-white p-5 shadow-[0_20px_44px_-22px_rgba(26,14,53,0.55)]">
-                <div
-                  ref={markerViewportRef}
-                  className="mx-auto flex w-full max-w-[320px] justify-center rounded-[14px] border border-[rgba(158,106,255,0.28)] bg-[#f4f1fc] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)]"
-                >
-                  <div className="relative w-fit max-w-full">
-                    <img
-                      ref={markerImageRef}
-                      src={uploadedImage.src}
-                      alt="User preview for shoulder marks"
-                      draggable={false}
-                      className={`block max-h-[min(38vh,280px)] max-w-full select-none object-contain ${
-                        isCropMode
-                          ? 'cursor-crosshair'
-                          : userPhotoStep === 'mark-shoulders'
-                            ? 'cursor-pointer'
-                            : 'cursor-default'
-                      }`}
-                      onLoad={(event) => {
-                        const el = event.currentTarget;
-                        setLayoutTick((t) => t + 1);
-                        setUploadedImage((prev) => {
-                          if (!prev || prev.src !== el.src) {
-                            return prev;
-                          }
-                          if (prev.naturalWidth === el.naturalWidth && prev.naturalHeight === el.naturalHeight) {
-                            return prev;
-                          }
-                          return {
-                            ...prev,
-                            naturalWidth: el.naturalWidth,
-                            naturalHeight: el.naturalHeight,
-                          };
-                        });
-                      }}
-                      onClick={handleUserMarkerClick}
-                    />
+          {uploadedImage && !dressRecoloringMode && !hasUserImage && (
+            <img
+              ref={markerImageRef}
+              src={uploadedImage.src}
+              alt="Uploaded user"
+              className="absolute inset-0 z-[1] h-full w-full object-contain"
+              onLoad={() => setLayoutTick((t) => t + 1)}
+              onClick={handleUserMarkerClick}
+              draggable={false}
+            />
+          )}
 
-                    <div className="pointer-events-none absolute inset-0 z-10">
-                      {cropOverlayStyle && (
-                        <div
-                          className="absolute z-30 border-2 border-dashed border-[#9e6aff] bg-[rgba(158,106,255,0.14)]"
-                          style={{
-                            left: cropOverlayStyle.left,
-                            top: cropOverlayStyle.top,
-                            width: cropOverlayStyle.width,
-                            height: cropOverlayStyle.height,
-                            boxSizing: 'border-box',
-                          }}
-                        />
-                      )}
+          <img
+            id="person-img"
+            ref={personImgRef}
+            alt="Your try-on photo"
+            onLoad={() => {
+              const el = personImgRef.current;
+              if (!el || el.naturalWidth < 1) {
+                return;
+              }
+              el.style.width = `${el.naturalWidth}px`;
+              el.style.height = `${el.naturalHeight}px`;
+              applyImageTransform();
+            }}
+          />
 
-                      {shoulderOverlayPoints.length > 0 && !isCropMode && (
-                        <ShoulderMarkers points={shoulderOverlayPoints} lineColor="rgba(120,88,200,0.95)" />
-                      )}
-                    </div>
+          <canvas
+            id="garment-canvas"
+            ref={garmentCanvasRef}
+            width={FRAME_W}
+            height={FRAME_H}
+            style={{ opacity: dressRecoloringMode || !isFabricOverlayApplied ? 0 : 1 }}
+          />
+          <canvas id="pick-canvas" ref={pickCanvasRef} width={FRAME_W} height={FRAME_H} />
 
-                    {isCropMode && (
-                      <div
-                        className="absolute inset-0 z-20 cursor-crosshair touch-none"
-                        style={{ touchAction: 'none' }}
-                        onPointerDown={handleCropPointerDown}
-                        aria-hidden
-                      />
-                    )}
-                  </div>
-                </div>
+          {(isCropMode || isSelectingRecolorArea) && (
+            <div
+              className="absolute inset-0 z-[20] cursor-crosshair touch-none"
+              style={{ touchAction: 'none' }}
+              onPointerDown={handleCropPointerDown}
+              aria-hidden
+            />
+          )}
 
-                {userPhotoStep === 'crop-or-skip' && !isCropMode && (
-                  <button
-                    type="button"
-                    onClick={skipCropUseFullImage}
-                    className="w-full rounded-full border border-[rgba(158,106,255,0.55)] bg-[rgba(158,106,255,0.08)] py-2.5 font-['Cabin:Semibold',sans-serif] text-[11px] text-[#5c4a8a] shadow-sm"
-                  >
-                    Use full image (skip crop)
-                  </button>
-                )}
+          {cropOverlayStyle && !dressRecoloringMode && (
+            <div
+              className="pointer-events-none absolute z-[25] border-2 border-dashed border-[#9e6aff] bg-[rgba(158,106,255,0.14)]"
+              style={{
+                left: cropOverlayStyle.left,
+                top: cropOverlayStyle.top,
+                width: cropOverlayStyle.width,
+                height: cropOverlayStyle.height,
+              }}
+            />
+          )}
 
-                <div className="grid grid-cols-2 gap-2.5">
-                  <button
-                    type="button"
-                    onClick={handleRemoveBackground}
-                    disabled={!uploadedImage || isCropMode || isRemovingBackground}
-                    className="w-full rounded-full border border-[rgba(158,106,255,0.4)] bg-white py-2.5 font-['Cabin:Semibold',sans-serif] text-[11px] text-[#6e5a9a] shadow-sm disabled:cursor-not-allowed disabled:opacity-45"
-                  >
-                    {isRemovingBackground ? 'Removing...' : 'Remove Background'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleCropButtonClick}
-                    disabled={isRemovingBackground}
-                    className="w-full rounded-full border border-[rgba(158,106,255,0.5)] bg-white py-2.5 font-['Cabin:Semibold',sans-serif] text-[11px] text-[#6e5a9a] shadow-sm disabled:cursor-not-allowed disabled:opacity-45"
-                  >
-                    {isCropMode ? 'Apply Crop' : 'Crop'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowUserMarkerModal(false);
-                      setIsCropMode(false);
-                      setCropRectNatural(null);
-                    }}
-                    className="w-full rounded-full border border-[rgba(158,106,255,0.4)] bg-white py-2.5 font-['Cabin:Semibold',sans-serif] text-[11px] text-[#6e5a9a] shadow-sm"
-                  >
-                    Cancel
-                  </button>
-                    <button
-                      type="button"
-                      onClick={applyGarmentAlignment}
-                      disabled={
-                        isRemovingBackground ||
-                        isCropMode ||
-                        userPhotoStep !== 'mark-shoulders' ||
-                        userNaturalPoints.length !== 2 ||
-                        !hasGarmentShoulders
-                      }
-                      className="w-full rounded-full bg-[#9e6aff] py-2.5 font-['Cabin:Semibold',sans-serif] text-[11px] text-white shadow-[0_6px_14px_-8px_rgba(120,80,200,0.65)] disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      Apply Garment
-                    </button>
-                </div>
-              </div>
+          {dressRecoloringMode && recolorRectNatural && recolorImageRef.current && (
+            <div
+              className="pointer-events-none absolute z-[25] border-2 border-dashed border-[#00af9d] bg-[rgba(0,175,157,0.15)]"
+              style={naturalRectToOverlayStyle(recolorRectNatural, recolorImageRef.current)}
+            />
+          )}
+
+          {isMarkingUserShoulders && shoulderOverlayPoints.length > 0 && !dressRecoloringMode && (
+            <div className="pointer-events-none absolute inset-0 z-[30]">
+              <ShoulderMarkers points={shoulderOverlayPoints} lineColor="rgba(120,88,200,0.95)" />
             </div>
           )}
+
+          {recolorMaskPreview && dressRecoloringMode && (isRecoloring || isSelectingRecolorArea) && (
+            <img
+              src={recolorMaskPreview}
+              alt="Mask preview"
+              className="pointer-events-none absolute inset-0 z-[2] h-full w-full object-contain opacity-30"
+            />
+          )}
+
+          {!dressRecoloringMode && hasUserImage && isFabricOverlayApplied && isMoveEnabled && (
+            <div
+              ref={tryOnInteractRef}
+              className="tryon-user-adjust-layer absolute inset-0 z-[4]"
+              onPointerDown={handleTryOnPointerDown}
+              onPointerMove={handleTryOnPointerMove}
+              onPointerUp={handleTryOnPointerUp}
+              onPointerCancel={handleTryOnPointerUp}
+              aria-hidden
+            />
+          )}
+
+          {!uploadedImage && (
+            <div className="absolute inset-0 z-[10] flex flex-col items-center justify-center gap-2 bg-[linear-gradient(180deg,rgba(251,251,254,0.98)_0%,rgba(243,246,250,0.98)_100%)] text-[#5b6070]">
+              <div className="flex h-14 w-14 items-center justify-center rounded-full border border-[rgba(91,96,112,0.28)] bg-white shadow-sm">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 16V8M8.5 11.5 12 8l3.5 3.5" stroke="#435066" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M4 16.5a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3" stroke="#435066" strokeWidth="1.8" strokeLinecap="round" />
+                </svg>
+              </div>
+              <p className="font-['Cabin:Semibold',sans-serif] text-[12px]">Upload image</p>
+            </div>
+          )}
+
+          {onToggleColorLike && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleColorLike();
+              }}
+              className="tryon-like-btn"
+              data-liked={isColorLiked ? 'true' : 'false'}
+              aria-label={isColorLiked ? 'Remove selected shade from recommended shades' : 'Add selected shade to recommended shades'}
+              title={isColorLiked ? 'Saved to recommended shades' : 'Save selected shade'}
+            >
+              <svg width="22" height="22" viewBox="0 -2 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <g transform="translate(-3)">
+                  <path
+                    d="M26,4c2.757,0,5,2.692,5,6,0,6.308-7.637,11.425-12,13.6C14.632,21.422,7,16.307,7,10c0-3.308,2.243-6,5-6a5.033,5.033,0,0,1,3.765,2.353l1.618,1.772a2,2,0,0,0,3.234,0l1.618-1.772A5.033,5.033,0,0,1,26,4m0-4a8.961,8.961,0,0,0-7,4,8.961,8.961,0,0,0-7-4C7.029,0,3,4.477,3,10,3,21.438,19,28,19,28s16-6.562,16-18c0-5.523-4.029-10-9-10Z"
+                    fill={isColorLiked ? '#dc2626' : 'none'}
+                    stroke={isColorLiked ? 'none' : '#0a0a0a'}
+                    strokeWidth={isColorLiked ? 0 : 1.15}
+                    strokeLinejoin="round"
+                  />
+                </g>
+              </svg>
+            </button>
+          )}
         </div>
+
+        {!dressRecoloringMode && isFabricOverlayApplied && (
+          <div className="pointer-events-auto absolute right-[-42px] top-[210px] z-[60] flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => setIsMoveEnabled((v) => !v)}
+              className={`h-8 w-8 rounded-[6px] border ${
+                isMoveEnabled ? 'border-[#062b3f] bg-white text-[#062b3f]' : 'border-[#9fb0ba] bg-white text-[#2f3e4a]'
+              }`}
+              title="Move"
+              aria-label="Move image"
+            >
+              <img src="/svg/move.svg" alt="" className="mx-auto h-4 w-4" draggable={false} />
+            </button>
+            <button
+              type="button"
+              onClick={() => zoomUserImage(1)}
+              className="h-8 w-8 rounded-[6px] border border-[#062b3f] bg-white text-[18px] leading-none text-[#062b3f]"
+              title="Zoom in"
+              aria-label="Zoom in"
+            >
+              <img src="/svg/zoom%20in.svg" alt="" className="mx-auto h-4 w-4" draggable={false} />
+            </button>
+            <button
+              type="button"
+              onClick={() => zoomUserImage(-1)}
+              className="h-8 w-8 rounded-[6px] border border-[#062b3f] bg-white text-[18px] leading-none text-[#062b3f]"
+              title="Zoom out"
+              aria-label="Zoom out"
+            >
+              <img src="/svg/zoom%20out.svg" alt="" className="mx-auto h-4 w-4" draggable={false} />
+            </button>
+          </div>
+        )}
       </div>
+
+      <canvas ref={baseCanvasRef} className="hidden" aria-hidden />
 
       <input
         ref={fileInputRef}
@@ -1650,36 +2035,106 @@ export function TryOnPreviewCard({
         onChange={handleUploadImage}
       />
 
-      <div className="absolute left-0 top-[578px] z-40 flex w-[420px] flex-wrap items-center justify-center gap-2 px-1">
-        {!dressRecoloringMode && (
-          <button
-            type="button"
-            onClick={handleMarkGarment}
-            className="rounded-full border border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] text-[#46425e] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)]"
-          >
-            Mark Garment
-          </button>
+      <div className="mt-4 flex w-[420px] flex-wrap items-center justify-center gap-2 px-1 pb-1">
+        {!dressRecoloringMode ? (
+          <>
+            <button
+              type="button"
+              onClick={handleRemoveBackground}
+              disabled={!uploadedImage || isRemovingBackground || isBackgroundRemoved}
+              className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-[#071d2a] px-4 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#b7bcc2]"
+            >
+              {isRemovingBackground ? 'Removing...' : isBackgroundRemoved ? 'Background Removed' : 'Remove BG'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleCropButtonClick}
+              disabled={!uploadedImage || isRemovingBackground}
+              className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-white px-4 py-2 text-[11px] font-semibold text-[#243848] disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              {isCropMode ? 'Apply Crop' : 'Crop'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (!uploadedImage) {
+                  return;
+                }
+                setIsMarkingUserShoulders((prev) => !prev);
+                setIsCropMode(false);
+                setCropRectNatural(null);
+                if (isMarkingUserShoulders) {
+                  setUserNaturalPoints([]);
+                }
+              }}
+              disabled={!uploadedImage || isRemovingBackground}
+              className={`rounded-[8px] border px-3 py-2 text-[11px] font-semibold disabled:cursor-not-allowed disabled:opacity-45 ${
+                isMarkingUserShoulders
+                  ? 'border-[#062b3f] bg-[#062b3f] text-white'
+                  : 'border-[rgba(6,43,63,0.42)] bg-white text-[#243848]'
+              }`}
+              title="Mark user shoulder points"
+            >
+              <img src="/svg/pointer.svg" alt="" className="mx-auto h-4 w-4" draggable={false} />
+            </button>
+
+            <button
+              type="button"
+              onClick={applyGarmentAlignment}
+              disabled={!uploadedImage || userNaturalPoints.length !== 2 || !hasGarmentShoulders}
+              className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-[#071d2a] px-5 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#b7bcc2]"
+            >
+              Apply
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={handleRemoveBackground}
+              disabled={!uploadedImage || isRemovingBackground || isBackgroundRemoved}
+              className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-[#071d2a] px-4 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#b7bcc2]"
+            >
+              {isRemovingBackground ? 'Removing...' : isBackgroundRemoved ? 'Background Removed' : 'Remove BG'}
+            </button>
+
+            <div className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-white px-2 py-1.5">
+              <select
+                value={selectedGarmentType}
+                onChange={(event) => setSelectedGarmentType(event.target.value)}
+                disabled={!uploadedImage}
+                className="min-w-[150px] bg-transparent text-[11px] font-semibold text-[#243848] outline-none disabled:cursor-not-allowed disabled:opacity-45"
+                aria-label="Select garment type"
+              >
+                {GARMENT_TYPE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleApplyRecolor}
+              disabled={!uploadedImage || isRecoloring}
+              className="rounded-[8px] border border-[rgba(6,43,63,0.42)] bg-[#071d2a] px-5 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#b7bcc2]"
+            >
+              {isRecoloring ? 'Applying...' : 'Apply'}
+            </button>
+          </>
         )}
+
         <button
           type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={!dressRecoloringMode && !hasGarmentShoulders}
-          className="rounded-full border border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] text-[#46425e] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)] disabled:cursor-not-allowed disabled:opacity-45"
+          onClick={resetToInitialUploadState}
+          className="flex h-[34px] w-[34px] items-center justify-center rounded-[8px] border border-[rgba(6,43,63,0.34)] bg-white"
+          title="Reset and upload new image"
+          aria-label="Reset and upload new image"
         >
-          Upload User Image
-        </button>
-        <button
-          type="button"
-          onClick={() => onDressRecoloringModeChange(!dressRecoloringMode)}
-          aria-pressed={dressRecoloringMode}
-          className={`rounded-full border px-4 py-2 font-['Cabin:Semibold',sans-serif] text-[11px] tracking-[0.2px] shadow-[0_6px_14px_-10px_rgba(21,16,42,0.55)] ${
-            dressRecoloringMode
-              ? 'border-[#9e6aff] bg-[rgba(158,106,255,0.14)] text-[#5c3eb8]'
-              : 'border-[rgba(64,58,92,0.26)] bg-[rgba(245,245,249,0.95)] text-[#46425e]'
-          }`}
-          title={dressRecoloringMode ? 'Return to virtual try-on' : 'Empty preview and upload a user image'}
-        >
-          Dress recoloring
+          <img src="/svg/reupload.svg" alt="" className="h-4 w-4" draggable={false} />
         </button>
       </div>
     </div>

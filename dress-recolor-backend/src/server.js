@@ -7,15 +7,23 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { v4 as uuidv4 } from "uuid";
 import axios from "axios";
-import FormData from "form-data";
-
-dotenv.config();
+import sharp from "sharp";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
+dotenv.config({ path: path.resolve(__dirname, "..", "..", ".env"), override: false });
+
 const app = express();
 const PORT = process.env.PORT || 4000;
+const HF_TOKEN = (process.env.HF_TOKEN || "").trim();
+const HF_SEGMENTATION_MODEL = (process.env.HF_SEGMENTATION_MODEL || "mattmdjaga/segformer_b2_clothes").trim();
+const HF_INFERENCE_API_BASE = (
+  process.env.HF_INFERENCE_API_BASE || "https://router.huggingface.co/hf-inference/models"
+)
+  .trim()
+  .replace(/\/+$/, "");
 
 app.use(
   cors({
@@ -62,7 +70,241 @@ const upload = multer({
 });
 
 const imageRegistry = new Map();
-const mlBaseUrl = (process.env.ML_SERVICE_URL || "http://127.0.0.1:8000").replace(/\/segmentation\/recolor\/?$/, "");
+
+const GARMENT_LABEL_HINTS = [
+  "upper-clothes",
+  "upper_clothes",
+  "dress",
+  "skirt",
+  "pants",
+  "belt",
+  "bag",
+  "scarf",
+  "left-shoe",
+  "right-shoe",
+  "shoe",
+  "coat",
+  "jacket",
+  "shirt",
+  "top",
+  "hoodie",
+  "sweater",
+];
+
+function buildProviderError(status, details) {
+  const error = new Error(details || "Provider request failed");
+  error.providerStatus = status;
+  return error;
+}
+
+function normalizeLabel(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+}
+
+function isGarmentLabel(value) {
+  const label = normalizeLabel(value);
+  if (!label || label.includes("background")) {
+    return false;
+  }
+  return GARMENT_LABEL_HINTS.some((hint) => label.includes(hint));
+}
+
+function garmentTypeHints(garmentType) {
+  const normalized = normalizeLabel(garmentType);
+  switch (normalized) {
+    case "upper-clothes":
+    case "upper-cloth":
+    case "tshirt":
+    case "shirt":
+    case "top":
+      return ["upper-clothes", "upper_clothes", "shirt", "top", "t-shirt", "tee"];
+    case "dress":
+      return ["dress", "gown"];
+    case "coat":
+    case "jacket":
+      return ["coat", "jacket", "blazer", "outerwear"];
+    case "sweater":
+    case "hoodie":
+      return ["sweater", "hoodie", "pullover", "knit"];
+    case "pants":
+    case "bottom":
+      return ["pants", "trouser", "jean", "leggings", "shorts"];
+    case "skirt":
+      return ["skirt"];
+    default:
+      return [];
+  }
+}
+
+function segmentMatchesGarmentType(label, garmentType) {
+  const hints = garmentTypeHints(garmentType);
+  if (!hints.length) {
+    return false;
+  }
+  const normalizedLabel = normalizeLabel(label);
+  return hints.some((hint) => normalizedLabel.includes(hint));
+}
+
+function stripDataUrlPrefix(b64) {
+  if (typeof b64 !== "string") {
+    return "";
+  }
+  const comma = b64.indexOf(",");
+  return comma >= 0 ? b64.slice(comma + 1) : b64;
+}
+
+async function decodeMaskToBinary(maskB64, width, height) {
+  const raw = Buffer.from(stripDataUrlPrefix(maskB64), "base64");
+  const gray = await sharp(raw)
+    .removeAlpha()
+    .greyscale()
+    .resize(width, height, { fit: "fill" })
+    .raw()
+    .toBuffer();
+
+  const binary = new Uint8Array(width * height);
+  for (let i = 0; i < binary.length; i += 1) {
+    binary[i] = gray[i] > 127 ? 1 : 0;
+  }
+  return binary;
+}
+
+function buildPolygonMask(width, height, points) {
+  const mask = new Uint8Array(width * height);
+  if (!Array.isArray(points) || points.length < 3) {
+    return mask;
+  }
+
+  const p = points.map((pt) => ({
+    x: Number(pt.x),
+    y: Number(pt.y),
+  }));
+
+  for (let y = 0; y < height; y += 1) {
+    const scanY = y + 0.5;
+    const intersections = [];
+
+    for (let i = 0; i < p.length; i += 1) {
+      const a = p[i];
+      const b = p[(i + 1) % p.length];
+      if (!Number.isFinite(a.x) || !Number.isFinite(a.y) || !Number.isFinite(b.x) || !Number.isFinite(b.y)) {
+        continue;
+      }
+      const intersects = (a.y <= scanY && b.y > scanY) || (b.y <= scanY && a.y > scanY);
+      if (!intersects) {
+        continue;
+      }
+      const t = (scanY - a.y) / (b.y - a.y);
+      intersections.push(a.x + t * (b.x - a.x));
+    }
+
+    intersections.sort((left, right) => left - right);
+
+    for (let i = 0; i + 1 < intersections.length; i += 2) {
+      let startX = Math.ceil(intersections[i]);
+      let endX = Math.floor(intersections[i + 1]);
+
+      if (endX < 0 || startX >= width) {
+        continue;
+      }
+      if (startX < 0) {
+        startX = 0;
+      }
+      if (endX >= width) {
+        endX = width - 1;
+      }
+
+      const row = y * width;
+      for (let x = startX; x <= endX; x += 1) {
+        mask[row + x] = 1;
+      }
+    }
+  }
+
+  return mask;
+}
+
+function countOverlap(maskA, maskB) {
+  let overlap = 0;
+  for (let i = 0; i < maskA.length; i += 1) {
+    if (maskA[i] && maskB[i]) {
+      overlap += 1;
+    }
+  }
+  return overlap;
+}
+
+async function saveMaskPreview(maskBinary, width, height, imageId) {
+  const rgba = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < maskBinary.length; i += 1) {
+    const o = i * 4;
+    if (maskBinary[i]) {
+      rgba[o] = 255;
+      rgba[o + 1] = 0;
+      rgba[o + 2] = 0;
+      rgba[o + 3] = 160;
+    }
+  }
+
+  const maskFilename = `${Date.now()}-${imageId}-mask.png`;
+  const maskPath = path.join(maskDir, maskFilename);
+  await sharp(rgba, {
+    raw: {
+      width,
+      height,
+      channels: 4,
+    },
+  })
+    .png()
+    .toFile(maskPath);
+
+  return `${getBaseUrl()}/static/masks/${maskFilename}`;
+}
+
+async function runHfSegmentation(meta) {
+  if (!HF_TOKEN) {
+    throw new Error("HF_TOKEN missing in environment");
+  }
+
+  const endpoint = `${HF_INFERENCE_API_BASE}/${HF_SEGMENTATION_MODEL}`;
+  const imageBuffer = fs.readFileSync(meta.path);
+
+  const response = await axios.post(endpoint, imageBuffer, {
+    headers: {
+      Authorization: `Bearer ${HF_TOKEN}`,
+      "Content-Type": meta.mimeType || "image/jpeg",
+      Accept: "application/json",
+    },
+    timeout: 120000,
+    validateStatus: () => true,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    const body = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
+    throw buildProviderError(response.status, `HF segmentation failed (${response.status}): ${body}`);
+  }
+
+  const payload = Array.isArray(response.data) ? response.data : [];
+  const usable = payload
+    .map((item) => ({
+      label: String(item?.label || ""),
+      score: Number(item?.score ?? 1),
+      mask: item?.mask,
+      binaryMask: null,
+    }))
+    .filter((segment) => segment.mask && segment.label);
+
+  if (!usable.length) {
+    throw new Error("HF segmentation returned no usable masks");
+  }
+
+  meta.hfSegments = usable;
+}
 
 function getBaseUrl() {
   const fromEnv = process.env.PUBLIC_BASE_URL;
@@ -83,38 +325,30 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
     id,
     path: filePath,
     originalName: req.file.originalname,
-    maskB64: null,
-    maskHeight: null,
-    maskWidth: null,
+    mimeType: req.file.mimetype || "image/jpeg",
+    width: null,
+    height: null,
+    hfSegments: null,
   };
   imageRegistry.set(id, meta);
 
   try {
-    const formData = new FormData();
-    formData.append("image", fs.createReadStream(filePath), {
-      filename: path.basename(filePath),
-      contentType: req.file.mimetype || "image/jpeg",
-    });
-    const runOnceRes = await axios.post(`${mlBaseUrl}/segmentation/run-once`, formData, {
-      headers: formData.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      responseType: "json",
-      timeout: 120000,
-    });
-    const { segmentation_mask_b64: maskB64, height: h, width: w } = runOnceRes.data || {};
-    if (maskB64 != null && h != null && w != null) {
-      meta.maskB64 = maskB64;
-      meta.maskHeight = h;
-      meta.maskWidth = w;
+    const metadata = await sharp(filePath).metadata();
+    if (!metadata.width || !metadata.height) {
+      throw new Error("Unable to read image dimensions");
     }
+    meta.width = metadata.width;
+    meta.height = metadata.height;
+
+    // Best-effort pre-segmentation. Failure here should not fail upload.
+    await runHfSegmentation(meta);
   } catch (err) {
-    console.error("Run-once segmentation error", err?.response?.data || err.message);
+    console.error("Upload segmentation warmup error", err?.message || err);
   }
 
   const dims =
-    meta.maskHeight != null && meta.maskWidth != null
-      ? { width: Number(meta.maskWidth), height: Number(meta.maskHeight) }
+    meta.width != null && meta.height != null
+      ? { width: Number(meta.width), height: Number(meta.height) }
       : {};
   return res.json({
     imageId: id,
@@ -125,7 +359,7 @@ app.post("/api/upload", upload.single("image"), async (req, res) => {
 
 app.post("/api/lasso-segmentation", async (req, res) => {
   const body = req.body || {};
-  let { imageId, lasso_points, selected_color } = body;
+  let { imageId, lasso_points, selected_color, garment_type } = body;
 
   if (!imageId) {
     return res.status(400).json({
@@ -152,105 +386,94 @@ app.post("/api/lasso-segmentation", async (req, res) => {
     return res.status(404).json({ error: "Image not found. Re-upload it." });
   }
 
-  // If no mask yet (e.g. run-once failed at upload), run segmentation now
-  if (!meta.maskB64) {
+  if (!meta.width || !meta.height) {
+    return res.status(500).json({ error: "Missing image dimensions. Re-upload the image." });
+  }
+
+  if (!Array.isArray(meta.hfSegments) || meta.hfSegments.length === 0) {
     try {
-      const runOnceForm = new FormData();
-      runOnceForm.append("image", fs.createReadStream(meta.path), {
-        filename: path.basename(meta.path),
-        contentType: "image/jpeg",
-      });
-      const runOnceRes = await axios.post(`${mlBaseUrl}/segmentation/run-once`, runOnceForm, {
-        headers: runOnceForm.getHeaders(),
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        responseType: "json",
-        timeout: 120000,
-      });
-      const { segmentation_mask_b64: maskB64, height: h, width: w } = runOnceRes.data || {};
-      if (maskB64 != null && h != null && w != null) {
-        meta.maskB64 = maskB64;
-        meta.maskHeight = h;
-        meta.maskWidth = w;
-      }
+      await runHfSegmentation(meta);
     } catch (err) {
-      console.error("Run-once (on-demand) error", err?.response?.data || err.message);
+      console.error("On-demand HF segmentation error", err?.message || err);
+      const providerStatus = Number(err?.providerStatus || 0);
+      if (providerStatus === 401 || providerStatus === 403) {
+        return res.status(403).json({
+          error: "Hugging Face token lacks required permissions for Inference Providers.",
+          details: err?.message || "Forbidden by provider",
+        });
+      }
+      if (providerStatus === 429) {
+        return res.status(429).json({
+          error: "Hugging Face rate limit reached.",
+          details: err?.message || "Too many requests",
+        });
+      }
       return res.status(502).json({
-        error: "Segmentation failed. Is the ML service running on port 8000?",
-        details: err?.response?.data?.detail ?? err?.message,
+        error: "Segmentation failed at provider.",
+        details: err?.message || "Unknown HF segmentation error",
       });
-    }
-    if (!meta.maskB64) {
-      return res.status(502).json({ error: "Could not get segmentation mask from ML service." });
     }
   }
 
-  const mlUrl = `${mlBaseUrl}/segmentation/recolor`;
   try {
-    const formData = new FormData();
-    // Scalars first
-    formData.append("segmentation_mask_b64", meta.maskB64);
-    formData.append("mask_height", String(meta.maskHeight));
-    formData.append("mask_width", String(meta.maskWidth));
-    formData.append("lasso_points", JSON.stringify(lasso_points));
-    formData.append("selected_color", selected_color || "#ff3366");
-    // Image last
-    formData.append("image", fs.createReadStream(meta.path), {
-      filename: path.basename(meta.path),
-      contentType: path.extname(meta.path).toLowerCase() === ".png" ? "image/png" : "image/jpeg",
-    });
-
-    const response = await axios.post(mlUrl, formData, {
-      headers: formData.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      responseType: "json",
-      timeout: 60000,
-    });
-
-    const { garment_mask_b64, height, width, mask_preview_png } = response.data || {};
-
-    if (!garment_mask_b64 || !height || !width) {
-      return res.status(500).json({ error: "ML service did not return garment mask" });
-    }
-
-    const baseUrl = getBaseUrl();
-    let maskUrl = null;
-    if (mask_preview_png) {
-      const maskFilename = `${Date.now()}-${imageId}-mask.png`;
-      const maskPath = path.join(maskDir, maskFilename);
-      const maskBuffer = Buffer.from(mask_preview_png, "base64");
-      fs.writeFileSync(maskPath, maskBuffer);
-      maskUrl = `${baseUrl}/static/masks/${maskFilename}`;
-    }
-
-    return res.json({
-      garment_mask_b64,
-      height,
-      width,
-      mask_preview: maskUrl,
-    });
-  } catch (err) {
-    const status = err?.response?.status;
-    const detail = err?.response?.data?.detail;
-    console.error("Error from ML service", status, detail ?? err?.response?.data ?? err.message);
-    if (status === 422 && typeof detail === "string" && detail.includes("No garment detected")) {
-      return res.status(422).json({ error: "No garment detected in selected area." });
-    }
-    if (status === 400 && detail != null) {
+    const width = meta.width;
+    const height = meta.height;
+    const lassoMask = buildPolygonMask(width, height, lasso_points);
+    if (!lassoMask.some((v) => v === 1)) {
       return res.status(400).json({
-        error: "Invalid request to recolor service",
-        details: typeof detail === "string" ? detail : JSON.stringify(detail),
+        error: "Invalid lasso selection. Please draw a closed area over the garment.",
       });
     }
-    const isConnectionError =
-      err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" || err.message?.includes("Network Error");
-    const details = isConnectionError
-      ? "ML service unreachable. Start the Python ML service (port 8000)."
-      : detail ?? err?.response?.data?.details ?? err?.message;
-    return res.status(status && status >= 400 ? status : 500).json({
+
+    const segments = meta.hfSegments.filter((segment) => isGarmentLabel(segment.label));
+    if (!segments.length) {
+      return res.status(422).json({ error: "No garment detected in selected area." });
+    }
+
+    const preferredSegments =
+      garment_type && String(garment_type).trim().length > 0
+        ? segments.filter((segment) => segmentMatchesGarmentType(segment.label, garment_type))
+        : [];
+    const candidateSegments = preferredSegments.length ? preferredSegments : segments;
+
+    let bestSegment = null;
+    let bestOverlap = 0;
+
+    for (const segment of candidateSegments) {
+      if (!segment.binaryMask) {
+        // Cache decoded masks to avoid repeated PNG decode on repeated lasso edits.
+        segment.binaryMask = await decodeMaskToBinary(segment.mask, width, height);
+      }
+      const overlap = countOverlap(segment.binaryMask, lassoMask);
+      if (
+        overlap > bestOverlap ||
+        (overlap === bestOverlap && bestSegment && Number(segment.score || 0) > Number(bestSegment.score || 0))
+      ) {
+        bestOverlap = overlap;
+        bestSegment = segment;
+      }
+    }
+
+    if (!bestSegment || bestOverlap === 0) {
+      return res.status(422).json({ error: "No garment detected in selected area." });
+    }
+
+    const garmentMaskBinary = bestSegment.binaryMask;
+    const garmentMaskB64 = Buffer.from(garmentMaskBinary).toString("base64");
+    const maskUrl = await saveMaskPreview(garmentMaskBinary, width, height, imageId);
+
+    return res.json({
+      garment_mask_b64: garmentMaskB64,
+      height,
+      width,
+      mask_preview: maskUrl ?? null,
+    });
+  } catch (err) {
+    const details = err?.message ?? "Unknown segmentation error";
+    console.error("Segmentation failure", details);
+    return res.status(500).json({
       error: "Failed to process segmentation request",
-      details: typeof details === "string" ? details : JSON.stringify(details),
+      details,
     });
   }
 });
@@ -272,5 +495,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Node backend listening on http://localhost:${PORT}`);
+  console.log(`Segmentation mode: HF API (${HF_SEGMENTATION_MODEL})`);
+  console.log(`HF token configured: ${HF_TOKEN ? "yes" : "no"}`);
 });
 

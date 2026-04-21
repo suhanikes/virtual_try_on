@@ -1,5 +1,5 @@
 .viewer-wrap {
-  padding: 14px;
+  padding: 10px;
   display: grid;
   place-items: center;
   background: #ffffff;
@@ -7,9 +7,9 @@
 }
 
 .frame {
-  width: min(92vw, 400px);
+  width: min(88vw, 360px);
   aspect-ratio: 2 / 3;
-  max-width: 380px;
+  max-width: 340px;
   border-radius: 14px;
   overflow: hidden;
   position: relative;

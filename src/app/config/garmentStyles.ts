@@ -8,11 +8,11 @@ export interface GarmentStyle {
   description?: string;
 }
 
-const discoveredModelModules = import.meta.glob('/public/models/**/*', {
-  eager: true,
-  import: 'default',
-  query: '?url',
-}) as Record<string, string>;
+const discoveredModelFiles = Object.keys(
+  import.meta.glob('/public/models/**/*', {
+    eager: false,
+  }),
+);
 
 const MODEL_FILE_EXTENSION = /\.(glb|gltf)$/i;
 
@@ -36,10 +36,10 @@ function toBaseId(baseName: string, index: number): string {
 function buildDiscoveredGarmentStyles(): GarmentStyle[] {
   const usedIds = new Map<string, number>();
 
-  return Object.entries(discoveredModelModules)
-    .filter(([filePath]) => MODEL_FILE_EXTENSION.test(filePath))
-    .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
-    .map(([filePath, assetUrl], index) => {
+  return discoveredModelFiles
+    .filter((filePath) => MODEL_FILE_EXTENSION.test(filePath))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
+    .map((filePath, index) => {
       const fileName = filePath.split('/').pop() ?? `garment-${index + 1}.glb`;
       const baseName = fileName.replace(/\.[^.]+$/, '').trim();
 
@@ -52,7 +52,7 @@ function buildDiscoveredGarmentStyles(): GarmentStyle[] {
       return {
         id: uniqueId,
         name: toDisplayName(baseName),
-        modelUrl: assetUrl,
+        modelUrl: filePath.replace(/^\/public/, ''),
         description: `Model file: ${fileName}`,
       };
     });

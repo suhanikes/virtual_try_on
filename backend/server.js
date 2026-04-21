@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -7,13 +7,26 @@ import multer from 'multer';
 import axios from 'axios';
 import FormData from 'form-data';
 import sharp from 'sharp';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const app = express();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, '.env') });
+dotenv.config({ path: path.resolve(__dirname, '..', '.env'), override: false });
 
 const PORT = Number(process.env.PORT || 3001);
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:5000';
 const ML_REQUEST_TIMEOUT_MS = Number(process.env.ML_REQUEST_TIMEOUT_MS || 300000);
 const MAX_IMAGE_DIMENSION = Number(process.env.MAX_IMAGE_DIMENSION || 3072);
+const BG_REMOVER_API_KEY = (process.env.BG_REMOVER_API_KEY || process.env.bg_remover_api_key || '').trim();
+const REMOVE_BG_API_URL = (process.env.REMOVE_BG_API_URL || 'https://api.remove.bg/v1.0/removebg').trim();
+const BG_REMOVE_MODE = (process.env.BG_REMOVE_MODE || (BG_REMOVER_API_KEY ? 'removebg-api' : 'ml-service'))
+  .trim()
+  .toLowerCase();
 
 function createRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -70,6 +83,28 @@ function mlServiceErrorMessage(error) {
   }
 
   return error?.message || 'Background removal failed';
+}
+
+function removeBgApiErrorMessage(error) {
+  if (error?.code === 'ECONNABORTED') {
+    return `remove.bg request timed out after ${Math.round(ML_REQUEST_TIMEOUT_MS / 1000)}s`;
+  }
+
+  const status = error?.response?.status;
+  if (status === 401 || status === 403) {
+    return 'remove.bg API key is invalid or unauthorized';
+  }
+  if (status === 402) {
+    return 'remove.bg credits exhausted or billing required';
+  }
+  if (status === 429) {
+    return 'remove.bg rate limit reached. Retry shortly.';
+  }
+  if (status) {
+    return `remove.bg returned status ${status}`;
+  }
+
+  return error?.message || 'remove.bg background removal failed';
 }
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
@@ -176,6 +211,63 @@ app.post('/api/remove-bg', upload.single('image'), async (req, res) => {
       return;
     }
 
+    if (BG_REMOVE_MODE === 'removebg-api') {
+      if (!BG_REMOVER_API_KEY) {
+        res.status(500).json({ error: 'bg_remover_api_key is missing in environment', reqId });
+        return;
+      }
+
+      const removeBgForm = new FormData();
+      removeBgForm.append('image_file', imageBuffer, {
+        filename: req.file.originalname || 'image.png',
+        contentType: 'image/png',
+      });
+      removeBgForm.append('size', 'auto');
+
+      const startedAt = Date.now();
+      log('remove-bg', 'Forwarding request to remove.bg API', {
+        reqId,
+        url: REMOVE_BG_API_URL,
+        timeoutMs: ML_REQUEST_TIMEOUT_MS,
+      });
+
+      const response = await axios.post(REMOVE_BG_API_URL, removeBgForm, {
+        headers: {
+          ...removeBgForm.getHeaders(),
+          'X-Api-Key': BG_REMOVER_API_KEY,
+        },
+        responseType: 'arraybuffer',
+        timeout: ML_REQUEST_TIMEOUT_MS,
+        validateStatus: () => true,
+      });
+
+      const apiDurationMs = Date.now() - startedAt;
+      if (response.status < 200 || response.status >= 300) {
+        const detail = parseMlErrorBody(response.data);
+        log('remove-bg', 'remove.bg returned non-success status', {
+          reqId,
+          status: response.status,
+          durationMs: apiDurationMs,
+          detail,
+        });
+
+        const error = new Error(`remove.bg failed (${response.status})`);
+        error.response = { status: response.status, data: response.data };
+        throw error;
+      }
+
+      log('remove-bg', 'remove.bg completed successfully', {
+        reqId,
+        durationMs: apiDurationMs,
+        outputBytes: Buffer.byteLength(response.data),
+      });
+
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('X-Request-Id', reqId);
+      res.send(Buffer.from(response.data));
+      return;
+    }
+
     const formData = new FormData();
     formData.append('file', imageBuffer, {
       filename: req.file.originalname || 'image.png',
@@ -226,7 +318,7 @@ app.post('/api/remove-bg', upload.single('image'), async (req, res) => {
   } catch (error) {
     const reqId = res.locals.reqId;
     const detailFromResponse = error?.response?.data ? parseMlErrorBody(error.response.data) : null;
-    const message = mlServiceErrorMessage(error);
+    const message = BG_REMOVE_MODE === 'removebg-api' ? removeBgApiErrorMessage(error) : mlServiceErrorMessage(error);
 
     log('remove-bg', 'Proxy request failed', {
       reqId,
@@ -236,12 +328,26 @@ app.post('/api/remove-bg', upload.single('image'), async (req, res) => {
       detailFromResponse,
     });
 
-    res.status(500).json({ error: message, detail: detailFromResponse, reqId });
+    const status = Number(error?.response?.status || 0);
+    const mappedStatus = status >= 400 && status < 600 ? status : 500;
+    res.status(mappedStatus).json({ error: message, detail: detailFromResponse, reqId });
   }
 });
 
 app.get('/health', async (req, res) => {
   const reqId = res.locals.reqId;
+  if (BG_REMOVE_MODE === 'removebg-api') {
+    res.status(200).json({
+      status: 'ok',
+      backend: true,
+      bgRemoveMode: BG_REMOVE_MODE,
+      removeBgApiUrl: REMOVE_BG_API_URL,
+      removeBgApiKeyConfigured: Boolean(BG_REMOVER_API_KEY),
+      reqId,
+    });
+    return;
+  }
+
   try {
     const response = await axios.get(`${ML_SERVICE_URL}/health`, {
       timeout: 15000,
@@ -302,6 +408,8 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Remove-bg backend running on port ${PORT}`);
+  console.log(`BG_REMOVE_MODE=${BG_REMOVE_MODE}`);
+  console.log(`remove.bg key configured=${BG_REMOVER_API_KEY ? 'yes' : 'no'}`);
   console.log(`ML_SERVICE_URL=${ML_SERVICE_URL}`);
   console.log(`ML_REQUEST_TIMEOUT_MS=${ML_REQUEST_TIMEOUT_MS}`);
   console.log(`MAX_IMAGE_DIMENSION=${MAX_IMAGE_DIMENSION}`);

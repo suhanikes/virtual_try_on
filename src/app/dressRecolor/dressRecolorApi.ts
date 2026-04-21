@@ -26,12 +26,23 @@ export type LassoSegmentationResponse = {
   mask_preview?: string;
 };
 
+export function decodeMaskB64ToUint8(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const len = binary.length;
+  const arr = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = binary.charCodeAt(i);
+  }
+  return arr;
+}
+
 export async function lassoSegmentation(params: {
   imageId: string;
   lassoPoints: LassoPoint[];
   selectedColor: string;
+  garmentType?: string;
 }): Promise<LassoSegmentationResponse> {
-  const { imageId, lassoPoints, selectedColor } = params;
+  const { imageId, lassoPoints, selectedColor, garmentType } = params;
   if (!imageId || !Array.isArray(lassoPoints) || lassoPoints.length < 3) {
     throw new Error('Need imageId and at least 3 lasso points.');
   }
@@ -41,6 +52,7 @@ export async function lassoSegmentation(params: {
       imageId,
       lasso_points: lassoPoints,
       selected_color: selectedColor ?? '#ff3366',
+      garment_type: garmentType ?? null,
     },
     { headers: { 'Content-Type': 'application/json' } },
   );

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface SubSeason {
   name: string;
@@ -158,9 +158,23 @@ interface ColorWheelFrameProps {
   season: SubSeason;
   isSelected: boolean;
   onClick: () => void;
+  uploadedImageSrc?: string | null;
+  avatarZoom: number;
+  avatarOffsetX: number;
+  avatarOffsetY: number;
+  onAvatarPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
 }
 
-function ColorWheelFrame({ season, isSelected, onClick }: ColorWheelFrameProps) {
+function ColorWheelFrame({
+  season,
+  isSelected,
+  onClick,
+  uploadedImageSrc,
+  avatarZoom,
+  avatarOffsetX,
+  avatarOffsetY,
+  onAvatarPointerDown,
+}: ColorWheelFrameProps) {
   const W = 308;
   const H = 185;
   const rx = 16;
@@ -218,9 +232,13 @@ function ColorWheelFrame({ season, isSelected, onClick }: ColorWheelFrameProps) 
           {/* White center */}
           <circle cx={cx} cy={cy} r={innerR} fill="rgba(255,255,255,0.92)" clipPath={`url(#${clipId})`} />
 
-          {/* Person silhouette */}
-          <circle cx={cx} cy={cy - 10} r={14} fill="#c8c0cc" clipPath={`url(#${clipId})`} />
-          <ellipse cx={cx} cy={cy + 32} rx={22} ry={16} fill="#c8c0cc" clipPath={`url(#${clipId})`} />
+          {!uploadedImageSrc && (
+            <>
+              {/* Person silhouette */}
+              <circle cx={cx} cy={cy - 10} r={14} fill="#c8c0cc" clipPath={`url(#${clipId})`} />
+              <ellipse cx={cx} cy={cy + 32} rx={22} ry={16} fill="#c8c0cc" clipPath={`url(#${clipId})`} />
+            </>
+          )}
 
           {/* Ring border */}
           <circle cx={cx} cy={cy} r={innerR} fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth={2} clipPath={`url(#${clipId})`} />
@@ -238,6 +256,32 @@ function ColorWheelFrame({ season, isSelected, onClick }: ColorWheelFrameProps) 
             {season.name}
           </text>
         </svg>
+
+        {uploadedImageSrc && (
+          <div
+            className="absolute overflow-hidden rounded-full border border-[rgba(255,255,255,0.85)] shadow-[0_1px_2px_rgba(0,0,0,0.15)]"
+            style={{
+              left: cx - innerR,
+              top: cy - innerR,
+              width: innerR * 2,
+              height: innerR * 2,
+              touchAction: 'none',
+              cursor: 'grab',
+            }}
+            onPointerDown={onAvatarPointerDown}
+          >
+            <img
+              src={uploadedImageSrc}
+              alt="Uploaded preview"
+              draggable={false}
+              className="h-full w-full object-cover select-none"
+              style={{
+                transform: `translate(${avatarOffsetX}px, ${avatarOffsetY}px) scale(${avatarZoom})`,
+                transformOrigin: '50% 50%',
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -249,16 +293,32 @@ interface SeasonSelectorPanelProps {
   mainSeason?: string;
   selectedSeason?: string;
   onSeasonChange?: (season: string) => void;
+  uploadedImageSrc?: string | null;
 }
 
 export function SeasonSelectorPanel({
   mainSeason = 'Spring',
   selectedSeason,
   onSeasonChange,
+  uploadedImageSrc,
 }: SeasonSelectorPanelProps) {
   const subSeasons = ALL_SEASONS[mainSeason] ?? ALL_SEASONS['Spring'];
   const defaultSelected = selectedSeason ?? subSeasons[0].name;
   const [selected, setSelected] = useState(defaultSelected);
+  const [avatarZoom, setAvatarZoom] = useState(1);
+  const [avatarOffsetX, setAvatarOffsetX] = useState(0);
+  const [avatarOffsetY, setAvatarOffsetY] = useState(0);
+  const dragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
+    active: false,
+    lastX: 0,
+    lastY: 0,
+  });
+
+  useEffect(() => {
+    setAvatarZoom(1);
+    setAvatarOffsetX(0);
+    setAvatarOffsetY(0);
+  }, [uploadedImageSrc]);
 
   // Reset selected sub-season when main season changes
   const currentSubSeasons = ALL_SEASONS[mainSeason] ?? ALL_SEASONS['Spring'];
@@ -270,6 +330,46 @@ export function SeasonSelectorPanel({
     setSelected(name);
     onSeasonChange?.(name);
   };
+
+  const handleAvatarPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!uploadedImageSrc) {
+      return;
+    }
+    event.preventDefault();
+    dragRef.current = {
+      active: true,
+      lastX: event.clientX,
+      lastY: event.clientY,
+    };
+  }, [uploadedImageSrc]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      if (!dragRef.current.active) {
+        return;
+      }
+      const dx = event.clientX - dragRef.current.lastX;
+      const dy = event.clientY - dragRef.current.lastY;
+      dragRef.current.lastX = event.clientX;
+      dragRef.current.lastY = event.clientY;
+      setAvatarOffsetX((prev) => prev + dx);
+      setAvatarOffsetY((prev) => prev + dy);
+    };
+
+    const stopDrag = () => {
+      dragRef.current.active = false;
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointercancel', stopDrag);
+
+    return () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', stopDrag);
+      window.removeEventListener('pointercancel', stopDrag);
+    };
+  }, []);
 
   return (
     <div
@@ -290,6 +390,42 @@ export function SeasonSelectorPanel({
         </p>
       </div>
 
+      {uploadedImageSrc && (
+        <div className="absolute right-[18px] top-[24px] flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setAvatarZoom((prev) => Math.min(3, prev + 0.08))}
+            className="h-7 w-7 rounded-[8px] border border-[rgba(6,43,63,0.32)] bg-white text-[16px] leading-none text-[#1f3342]"
+            aria-label="Zoom in season image"
+            title="Zoom in"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            onClick={() => setAvatarZoom((prev) => Math.max(0.65, prev - 0.08))}
+            className="h-7 w-7 rounded-[8px] border border-[rgba(6,43,63,0.32)] bg-white text-[16px] leading-none text-[#1f3342]"
+            aria-label="Zoom out season image"
+            title="Zoom out"
+          >
+            -
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAvatarZoom(1);
+              setAvatarOffsetX(0);
+              setAvatarOffsetY(0);
+            }}
+            className="rounded-[8px] border border-[rgba(6,43,63,0.32)] bg-white px-2 py-1 text-[11px] font-semibold text-[#1f3342]"
+            aria-label="Reset season image position"
+            title="Reset"
+          >
+            Reset
+          </button>
+        </div>
+      )}
+
       {/* Sub-season wheel cards */}
       <div className="absolute left-[16px] flex flex-col gap-[14px]" style={{ top: 72 }}>
         {currentSubSeasons.map((season) => (
@@ -298,6 +434,11 @@ export function SeasonSelectorPanel({
             season={season}
             isSelected={validSelected === season.name}
             onClick={() => handleSelect(season.name)}
+            uploadedImageSrc={uploadedImageSrc}
+            avatarZoom={avatarZoom}
+            avatarOffsetX={avatarOffsetX}
+            avatarOffsetY={avatarOffsetY}
+            onAvatarPointerDown={handleAvatarPointerDown}
           />
         ))}
       </div>

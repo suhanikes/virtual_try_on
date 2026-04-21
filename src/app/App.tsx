@@ -1,5 +1,5 @@
-import ColorAnalysis from "../imports/ColorAnalysis/ColorAnalysis";
 import { useEffect, useState } from "react";
+import ColorAnalysis from "../imports/ColorAnalysis/ColorAnalysis";
 
 export default function App() {
   const [scale, setScale] = useState(1);
