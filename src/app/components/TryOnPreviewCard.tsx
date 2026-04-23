@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { ChangeEvent, DragEvent, MouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
 import { garmentStyles } from '../config/garmentStyles';
 import type { FabricOption } from '../types/fabric';
 import { lassoSegmentation, uploadImage } from '../dressRecolor/dressRecolorApi';
@@ -104,7 +105,7 @@ const FABRIC_MESH_EXCLUDE = ['button', 'zip', 'zipper', 'buckle', 'snap', 'rivet
 const FABRIC_CACHE_LIMIT = 2;
 
 type FabricTextureSet = {
-  colorMap: THREE.Texture | null;
+  neutralDetailMap: THREE.Texture | null;
   normalMap: THREE.Texture;
   roughnessMap: THREE.Texture;
   displacementMap: THREE.Texture;
@@ -148,7 +149,7 @@ function configureTexture(texture: THREE.Texture, repeat: [number, number], isCo
 }
 
 function applyRepeat(textureSet: FabricTextureSet, repeat: [number, number]) {
-  textureSet.colorMap?.repeat.set(repeat[0], repeat[1]);
+  textureSet.neutralDetailMap?.repeat.set(repeat[0], repeat[1]);
   textureSet.normalMap.repeat.set(repeat[0], repeat[1]);
   textureSet.roughnessMap.repeat.set(repeat[0], repeat[1]);
   textureSet.displacementMap.repeat.set(repeat[0], repeat[1]);
@@ -156,15 +157,63 @@ function applyRepeat(textureSet: FabricTextureSet, repeat: [number, number]) {
 }
 
 function disposeTextureSet(textureSet: FabricTextureSet) {
-  textureSet.colorMap?.dispose();
+  textureSet.neutralDetailMap?.dispose();
   textureSet.normalMap.dispose();
   textureSet.roughnessMap.dispose();
   textureSet.displacementMap.dispose();
   textureSet.aoMap?.dispose();
 }
 
+function createNeutralDetailMap(source: THREE.Texture | null, repeat: [number, number]): THREE.Texture | null {
+  if (!source?.image) {
+    return null;
+  }
+
+  const image = source.image as { width?: number; height?: number };
+  const width = image.width ?? 0;
+  const height = image.height ?? 0;
+  if (width < 1 || height < 1) {
+    return null;
+  }
+
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return null;
+    }
+
+    context.drawImage(source.image as CanvasImageSource, 0, 0, width, height);
+    const imageData = context.getImageData(0, 0, width, height);
+    const data = imageData.data;
+    const detailStrength = 0.58;
+
+    for (let idx = 0; idx < data.length; idx += 4) {
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      const centered = 128 + (luminance - 128) * detailStrength;
+      const clamped = Math.max(0, Math.min(255, Math.round(centered)));
+      data[idx] = clamped;
+      data[idx + 1] = clamped;
+      data[idx + 2] = clamped;
+    }
+
+    context.putImageData(imageData, 0, 0);
+
+    const neutralTexture = new THREE.CanvasTexture(canvas);
+    configureTexture(neutralTexture, repeat, true);
+    return neutralTexture;
+  } catch (error) {
+    console.warn('[TryOnPreviewCard] Failed to create neutral detail map.', error);
+    return null;
+  }
+}
+
 async function loadTexture(
-  loader: THREE.TextureLoader,
   url: string,
   repeat: [number, number],
   isColorTexture = false,
@@ -182,7 +231,9 @@ async function loadTexture(
 
   for (const candidateUrl of uniqueCandidates) {
     try {
+      const isExr = candidateUrl.toLowerCase().endsWith('.exr');
       const texture = await new Promise<THREE.Texture>((resolve, reject) => {
+        const loader = isExr ? new EXRLoader() : new THREE.TextureLoader();
         loader.load(
           candidateUrl,
           (loadedTexture) => {
@@ -208,21 +259,20 @@ async function loadTexture(
 }
 
 async function loadFabricTextureSet(fabric: FabricOption): Promise<FabricTextureSet> {
-  const loader = new THREE.TextureLoader();
   const [colorMap, normalMap, roughnessMap, displacementMap, aoMap] = await Promise.all([
     fabric.maps.colorMapUrl
-      ? loadTexture(loader, fabric.maps.colorMapUrl, fabric.repeat, true, true)
+      ? loadTexture(fabric.maps.colorMapUrl, fabric.repeat, true, true)
       : Promise.resolve(null),
-    loadTexture(loader, fabric.maps.normalMapUrl, fabric.repeat),
-    loadTexture(loader, fabric.maps.roughnessMapUrl, fabric.repeat),
-    loadTexture(loader, fabric.maps.displacementMapUrl, fabric.repeat),
+    loadTexture(fabric.maps.normalMapUrl, fabric.repeat),
+    loadTexture(fabric.maps.roughnessMapUrl, fabric.repeat),
+    loadTexture(fabric.maps.displacementMapUrl, fabric.repeat),
     fabric.maps.aoMapUrl
-      ? loadTexture(loader, fabric.maps.aoMapUrl, fabric.repeat, false, true)
+      ? loadTexture(fabric.maps.aoMapUrl, fabric.repeat, false, true)
       : Promise.resolve(null),
   ]);
 
   return {
-    colorMap,
+    neutralDetailMap: createNeutralDetailMap(colorMap, fabric.repeat),
     normalMap: normalMap as THREE.Texture,
     roughnessMap: roughnessMap as THREE.Texture,
     displacementMap: displacementMap as THREE.Texture,
@@ -1056,13 +1106,16 @@ export function TryOnPreviewCard({
 
             if (activeFabric && textureSet) {
               fabricMaterial = new THREE.MeshStandardMaterial({
-                map: textureSet.colorMap,
+                // Keep palette color authoritative: fabric selection should only alter surface texture detail.
+                map: textureSet.neutralDetailMap,
                 normalMap: textureSet.normalMap,
-                normalScale: new THREE.Vector2(1.5, 1.5),
+                normalScale: new THREE.Vector2(2.35, 2.35),
                 roughnessMap: textureSet.roughnessMap,
                 roughness: 1.0,
+                bumpMap: textureSet.displacementMap,
+                bumpScale: lowPoly ? 0.022 : 0.03,
                 displacementMap: lowPoly ? null : textureSet.displacementMap,
-                displacementScale: lowPoly ? 0 : 0.02,
+                displacementScale: lowPoly ? 0 : 0.035,
                 aoMap: aoTex,
                 aoMapIntensity: aoTex ? 1.0 : 0,
                 metalness: 0.05,

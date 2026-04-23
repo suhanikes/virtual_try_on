@@ -2,6 +2,7 @@ import svgPaths from "./svg-6yqrwznnmc";
 import { imgGroup, imgGroup1, imgGroup2 } from "./svg-ujm6c";
 import { SeasonSelectorPanel } from "../../app/components/SeasonSelectorPanel";
 import { garmentStyles } from "../../app/config/garmentStyles";
+import { FABRIC_OPTIONS } from "../../app/config/fabricOptions";
 import type { FabricOption } from "../../app/types/fabric";
 import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 
@@ -23,85 +24,6 @@ function normalizeColor(color: string) {
 }
 
 const RECOMMENDED_SHADES_STORAGE_KEY = "recommended-shades";
-
-const FABRIC_OPTIONS: FabricOption[] = [
-  {
-    id: "fabric060",
-    label: "Cotton",
-    previewUrl: "/texture/cotton/Fabric060.png",
-    repeat: [4, 4],
-    maps: {
-      colorMapUrl: "/texture/cotton/Fabric060_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/cotton/Fabric060_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/cotton/Fabric060_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/cotton/Fabric060_1K-JPG_Displacement.jpg",
-      aoMapUrl: "/texture/cotton/Fabric060_1K-JPG_AmbientOcclusion.jpg",
-    },
-  },
-  {
-    id: "fabric048",
-    label: "Quilted Puffer",
-    previewUrl: "/texture/vest/Fabric048.png",
-    repeat: [2, 2],
-    maps: {
-      colorMapUrl: "/texture/vest/Fabric048_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/vest/Fabric048_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/vest/Fabric048_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/vest/Fabric048_1K-JPG_Displacement.jpg",
-      aoMapUrl: "/texture/vest/Fabric048_1K-JPG_AmbientOcclusion.jpg",
-    },
-  },
-  {
-    id: "fabric045",
-    label: "Boucle",
-    previewUrl: "/texture/pile/Fabric045.png",
-    repeat: [4, 4],
-    maps: {
-      colorMapUrl: "/texture/pile/Fabric045_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/pile/Fabric045_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/pile/Fabric045_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/pile/Fabric045_1K-JPG_Displacement.jpg",
-      aoMapUrl: "/texture/pile/Fabric045_1K-JPG_AmbientOcclusion.jpg",
-    },
-  },
-  {
-    id: "fabric080",
-    label: "Plaid Tartan",
-    previewUrl: "/texture/plaid/Fabric080.png",
-    repeat: [1, 1],
-    maps: {
-      colorMapUrl: "/texture/plaid/Fabric080_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/plaid/Fabric080_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/plaid/Fabric080_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/plaid/Fabric080_1K-JPG_Displacement.jpg",
-    },
-  },
-  {
-    id: "fabric061",
-    label: "Panama Weave",
-    previewUrl: "/texture/wool/Fabric061.png",
-    repeat: [5, 5],
-    maps: {
-      colorMapUrl: "/texture/wool/Fabric061_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/wool/Fabric061_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/wool/Fabric061_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/wool/Fabric061_1K-JPG_Displacement.jpg",
-      aoMapUrl: "/texture/wool/Fabric061_1K-JPG_AmbientOcclusion.jpg",
-    },
-  },
-  {
-    id: "fabric077",
-    label: "Denim",
-    previewUrl: "/texture/denim/Fabric077.png",
-    repeat: [3, 3],
-    maps: {
-      colorMapUrl: "/texture/denim/Fabric077_1K-JPG_Color.jpg",
-      normalMapUrl: "/texture/denim/Fabric077_1K-JPG_NormalGL.jpg",
-      roughnessMapUrl: "/texture/denim/Fabric077_1K-JPG_Roughness.jpg",
-      displacementMapUrl: "/texture/denim/Fabric077_1K-JPG_Displacement.jpg",
-    },
-  },
-];
 
 function loadRecommendedShadesFromStorage() {
   if (typeof window === "undefined") {
